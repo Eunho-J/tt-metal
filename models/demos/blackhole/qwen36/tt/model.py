@@ -791,15 +791,15 @@ class Qwen36Model:
     # Fixed bucket lengths for the masked tail/short-prompt prefill. Every real length
     # rounds up to one of these, so only this many programs ever compile — small enough to
     # warm up before a trace is parked (vs the unbounded per-length eager tail). All are
-    # multiples of the GDN sub-chunk (128) so the chunk kernel adds no internal pad. The
-    # masked GDN path runs in DRAM (see gated_deltanet_forward_ttnn), which keeps bucket 512
-    # off the L1 circular-buffer clash that the eager L1 path hits at that exact size.
+    # multiples of the GDN sub-chunk (128) so the chunk kernel adds no internal pad. All GDN
+    # prefill paths keep sequence activations in DRAM so the scan kernel owns the L1 space
+    # reserved for its static circular buffers.
     #
     # NOTE: this is a DELIBERATE divergence from the standard common.get_padded_prefill_len
     # bucket set {128, 1024, 2048, 4096, ...}. The small 256/512 buckets exist for short-prompt
-    # TTFT, every entry is a 128-multiple for GDN sub-chunk alignment, and 512 must stay in the
-    # masked-DRAM path (see above). The standard pad helper is for token-padding-tolerant softmax
-    # attention; GDN needs these specific bucket boundaries plus the exact valid_len mask.
+    # TTFT, and every entry is a 128-multiple for GDN sub-chunk alignment. The standard pad helper
+    # is for token-padding-tolerant softmax attention; GDN needs these specific bucket boundaries
+    # plus the exact valid_len mask.
     _PREFILL_MASK_BUCKETS = (128, 256, 512, 1024, 2048)
 
     @classmethod

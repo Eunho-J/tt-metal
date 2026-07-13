@@ -342,8 +342,7 @@ def test_demo_text(
 
     # Warmup: compile programs (not counted in TTFT). A short traced prompt takes the masked
     # fixed-bucket path, whose programs are compiled inside capture_prefill_trace_chunked
-    # (warmup_prefill_masked_buckets), so the legacy model.prefill warmup is redundant there —
-    # and it would hit the pre-existing small-T L1 clash in the non-paged concat path. Skip it.
+    # (warmup_prefill_masked_buckets), so the legacy model.prefill warmup is redundant there.
     PREFILL_CHUNK = 2048
     t_compile = time.time()
     if not (use_trace and actual_len < PREFILL_CHUNK):
