@@ -17,13 +17,6 @@ from .ttnn_delta_rule_ops import (
 )
 from .ttnn_delta_rule_seq import chunk_gated_delta_rule_seq_adapter
 
-_L1_SEQ_THRESHOLD = 512
-
-
-def _seq_memory_config(seq_len):
-    """L1 for short sequences (faster), DRAM for long (avoids OOM)."""
-    return ttnn.L1_MEMORY_CONFIG if seq_len <= _L1_SEQ_THRESHOLD else None
-
 
 def rms_norm_gated_ttnn(x, gate, weight, eps=1e-5, memory_config=None):
     """RMSNorm with SiLU gating — fused ttnn.rms_norm (trace-compatible, no try/except).
@@ -500,13 +493,17 @@ def gated_deltanet_forward_ttnn(
 
     B = hidden_states.shape[0]
     T = hidden_states.shape[1]
-    # Masked fixed-bucket prefill (valid_len set) rounds the real length UP to a bucket, so
-    # T is a bucket size rather than the real length. At bucket 512 the GDN's L1 interleaved
-    # buffers clash with its ops' static circular buffers (seq_len 512 sits exactly on the
-    # _seq_memory_config L1 threshold); force DRAM on the masked path so every bucket is
-    # robust. Prefill is compute-bound, so the lost L1 win is marginal. Non-masked paths
-    # (decode, the eager/traced chunk prefill) keep their original L1/DRAM selection.
-    mc = None if valid_len is not None else _seq_memory_config(T)
+    # Chunk prefill launches gated_delta_attn_seq, whose large static circular buffers need
+    # the per-core L1 address space. Keep the surrounding sequence activations in DRAM
+    # regardless of sequence length. Single-token recurrent decode retains L1 placement;
+    # the general recurrent path preserves its caller's placement.
+    uses_seq_scan = mode == "chunk" and T > 1
+    if uses_seq_scan:
+        mc = ttnn.DRAM_MEMORY_CONFIG
+    elif T == 1:
+        mc = ttnn.L1_MEMORY_CONFIG
+    else:
+        mc = hidden_states.memory_config()
 
     # 1. Linear projections — fused QKV when available (1 matmul instead of 3)
     ckc = compute_kernel_config
@@ -805,7 +802,7 @@ def gated_deltanet_forward_ttnn(
     # For prefill (T>1), always prefer chunk mode for precision — the chunk
     # implementation already handles T < chunk_size via padding.
     # For decode (T=1), use optimized decode path (fewer ops, no loop).
-    if mode == "chunk" and T > 1:
+    if uses_seq_scan:
         # Chunk-parallel prefill via the C++ gated_delta_attn_seq kernel (float32).
         o, new_state = chunk_gated_delta_rule_seq_adapter(
             q=q,

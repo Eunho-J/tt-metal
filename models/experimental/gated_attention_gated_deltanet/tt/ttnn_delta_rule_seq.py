@@ -82,8 +82,8 @@ def chunk_gated_delta_rule_seq_adapter(
     BH = B * H
 
     # L2-norm q/k (the seq kernel does NOT normalize; it only scales q internally).
-    q = l2_norm_ttnn(q, dim=-1)
-    k = l2_norm_ttnn(k, dim=-1)
+    q = l2_norm_ttnn(q, dim=-1, memory_config=_DRAM)
+    k = l2_norm_ttnn(k, dim=-1, memory_config=_DRAM)
 
     def _to_bhtd(t, D):  # [B,T,H,D] -> [BH,T,D] float32 TILE/DRAM (ROW_MAJOR-correct)
         t = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT, memory_config=_DRAM)
@@ -611,6 +611,7 @@ def chunk_gated_delta_rule_seq(
         dl_exp_4d,
         L_inv_4d,
         initial_state=S0_tt,
+        memory_config=_DRAM,
     )
     ttnn.deallocate(L_inv_4d)
 

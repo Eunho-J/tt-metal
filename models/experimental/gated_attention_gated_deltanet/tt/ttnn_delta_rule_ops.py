@@ -294,11 +294,9 @@ def _get_matmul_program_config(m, k, n, grid_size=None, in0_block_w=None):
         return None
 
 
-def l2_norm_ttnn(x, dim=-1, eps=1e-6):
-    """L2 normalization along a given dimension."""
-    # Use DRAM for large tensors (T>512 produces tensors that don't fit in L1)
-    T = x.shape[1] if len(x.shape) >= 3 else x.shape[0]
-    mc = ttnn.L1_MEMORY_CONFIG if T <= 512 else ttnn.DRAM_MEMORY_CONFIG
+def l2_norm_ttnn(x, dim=-1, eps=1e-6, memory_config=None):
+    """L2 normalization along a given dimension, preserving placement by default."""
+    mc = x.memory_config() if memory_config is None else memory_config
     x_sq = ttnn.multiply(x, x, memory_config=mc)
     norm_sq = ttnn.sum(x_sq, dim=dim, keepdim=True, memory_config=mc)
     inv_norm = ttnn.rsqrt(ttnn.add(norm_sq, eps, memory_config=mc), memory_config=mc)
