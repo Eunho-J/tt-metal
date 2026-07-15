@@ -114,7 +114,16 @@ ConvTranspose2dResult conv_transpose2d_L1(
         dims.input_pad_left,
         dims.input_pad_right);
 
-    const bool mm_conv = use_matmul_for_1x1_conv(kernel_size, stride, padding, dilation, groups, conv_config);
+    const bool mm_conv = use_matmul_for_1x1_conv(
+        kernel_size,
+        stride,
+        padding,
+        dilation,
+        groups,
+        conv_config,
+        tt::tt_metal::is_device_tensor(input_tensor) && input_tensor.is_sharded()
+            ? std::make_optional(input_tensor.memory_config())
+            : std::nullopt);
     // Grouped conv_transpose2d embeds grouping by expanding the weights before the conv2d micro-op.
     const uint32_t conv_groups = groups > 1 ? 1 : groups;
 
@@ -158,18 +167,19 @@ ConvTranspose2dResult conv_transpose2d_L1(
     const bool should_deallocate_act = conv_config.deallocate_activation && !input_tensor.memory_config().is_dram();
 
     // Call Halo Transpose
-    auto [input_tensor_post_tm, parallel_config, output_parallel_config] = shard_or_reshard_tensor_if_required(
-        device,
-        input_tensor,
-        conv_config,
-        batch_size,
-        dims.output_height,
-        dims.output_width,
-        in_channels,
-        out_channels,
-        mm_conv,
-        auto_shard,
-        false);
+    auto [input_tensor_post_tm, parallel_config, output_parallel_config, in_channels_padded] =
+        shard_or_reshard_tensor_if_required(
+            device,
+            input_tensor,
+            conv_config,
+            batch_size,
+            dims.output_height,
+            dims.output_width,
+            in_channels,
+            out_channels,
+            mm_conv,
+            auto_shard,
+            false);
 
     // Call Conv2d u_op with Stride = 1, Padding = 0.
     // Pad out_channels to be divisible by (num_cores_channels * TILE_WIDTH) to ensure
@@ -187,14 +197,6 @@ ConvTranspose2dResult conv_transpose2d_L1(
         get_num_cores_channels_from_parallel_config(parallel_config),
         get_num_cores_channels_from_parallel_config(output_parallel_config));
 
-    const uint32_t input_channels_alignment = get_input_channels_alignment(
-        input_tensor_post_tm.memory_config().memory_layout(),
-        input_tensor.layout(),
-        false,
-        mm_conv,
-        input_tensor_post_tm.memory_config());
-    uint32_t in_channels_padded = tt::round_up(
-        in_channels, get_num_cores_channels_from_parallel_config(parallel_config) * input_channels_alignment);
     uint32_t nhw_out_padded_ntile_per_core =
         conv_out_memory_config.shard_spec().value().shape[0] / tt::constants::TILE_HEIGHT;
     const bool conv_is_1d_depthwise = is_1d_depthwise_conv(
@@ -242,7 +244,7 @@ ConvTranspose2dResult conv_transpose2d_L1(
         }
 
         Conv2dWeightsBiasPrepConfig params(
-            input_channels_alignment,
+            in_channels_padded,
             conv_config.weights_dtype,
             opt_conv_op_block_config.act_block_w_ntiles,
             opt_conv_op_block_config.out_subblock_w_ntiles,
@@ -663,9 +665,9 @@ public:
         const uint32_t input_channels_alignment = get_input_channels_alignment(
             conv_config.shard_layout.value(),
             conv_config.output_layout,
-            slice_config.num_slices > 1,
+            sliced_input_tensor_memory_config.buffer_type(),
             false,  // Matmul based convs should never take the slicing route.
-            std::nullopt);
+            sliced_input_tensor_memory_config);
         uint32_t precise_max_halo_bytes =
             sliding_window::calculate_precise_halo_output_elems(slice_halo_config, shard_shape) * input_datum_size;
         auto compute_grid = device->compute_with_storage_grid_size();
@@ -927,6 +929,40 @@ Result conv_transpose2d_DRAM(
         input_height, input_width, kernel_size, stride, padding, output_padding, dilation);
     auto padding_n4 = sliding_window::get_pair_n4_padding(padding);
 
+    const bool mm_conv = use_matmul_for_1x1_conv(
+        kernel_size,
+        stride,
+        padding_n4,
+        dilation,
+        groups,
+        conv_config,
+        tt::tt_metal::is_device_tensor(input_tensor) && input_tensor.is_sharded()
+            ? std::make_optional(input_tensor.memory_config())
+            : std::nullopt);
+    if (mm_conv) {
+        return conv_transpose2d_L1(
+            input_tensor,
+            weight_tensor,
+            device,
+            in_channels,
+            out_channels,
+            batch_size,
+            input_height,
+            input_width,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            dilation,
+            groups,
+            dtype,
+            bias_tensor,
+            conv_config_,
+            compute_config_,
+            memory_config_,
+            mirror_kernel);
+    }
+
     // Early auto-determination: If auto-slicing is requested (num_slices=0), determine the configuration
     // before deciding L1 vs DRAM path. This prevents double-preparation of weights when auto-slicing
     // determines that L1 path should be used.
@@ -1007,7 +1043,6 @@ Result conv_transpose2d_DRAM(
         dims.input_pad_left,
         dims.input_pad_right);
 
-    const bool mm_conv = use_matmul_for_1x1_conv(kernel_size, stride, padding_n4, dilation, groups, conv_config);
     Tensor input_tensor_on_device = input_tensor;
     if (!is_device_tensor(input_tensor_on_device)) {
         input_tensor_on_device =
@@ -1015,29 +1050,6 @@ Result conv_transpose2d_DRAM(
     }
     ttnn::Tensor weight_tensor_on_device;
     std::optional<ttnn::Tensor> bias_tensor_on_device;
-    if (mm_conv) {
-        return conv_transpose2d_L1(
-            input_tensor,
-            weight_tensor,
-            device,
-            in_channels,
-            out_channels,
-            batch_size,
-            input_height,
-            input_width,
-            kernel_size,
-            stride,
-            padding,
-            output_padding,
-            dilation,
-            groups,
-            dtype,
-            bias_tensor,
-            conv_config_,
-            compute_config_,
-            memory_config_,
-            mirror_kernel);
-    }
     if (memory_config_.has_value()) {
         log_warning(
             tt::LogOp,

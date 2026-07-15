@@ -61,7 +61,52 @@ def test_quasar_depthwise_rejects_actual_block_layout_with_height_config(device)
 
 
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 1 << 15}], indirect=True)
-def test_quasar_depthwise_accepts_public_prepared_weight(device):
+def test_quasar_depthwise_reshards_block_input_to_height(device):
+    channels = 64
+    input_width = 32
+    kernel_width = 4
+    block_memory_config = ttnn.create_sharded_memory_config(
+        [1, 1, input_width, channels],
+        core_grid=ttnn.CoreGrid(x=4, y=1),
+        strategy=ttnn.ShardStrategy.BLOCK,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    torch_input, torch_weight, input_tt, weight_tt = make_depthwise_conv1d_tensors(
+        device,
+        channels=channels,
+        input_width=input_width,
+        kernel_width=kernel_width,
+        memory_config=block_memory_config,
+    )
+    golden = torch.nn.functional.conv2d(torch_input, torch_weight, groups=channels)
+    conv_config = ttnn.Conv2dConfig(
+        weights_dtype=ttnn.bfloat16,
+        shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        reshard_if_not_optimal=True,
+    )
+
+    output_tt, [output_height, output_width] = ttnn.experimental.quasar.conv2d(
+        input_tensor=input_tt,
+        weight_tensor=weight_tt,
+        device=device,
+        in_channels=channels,
+        out_channels=channels,
+        batch_size=1,
+        input_height=1,
+        input_width=input_width,
+        kernel_size=(1, kernel_width),
+        groups=channels,
+        conv_config=conv_config,
+        return_output_dim=True,
+    )
+    assert output_tt.memory_config().memory_layout == ttnn.TensorMemoryLayout.HEIGHT_SHARDED
+    output = ttnn.to_torch(output_tt).reshape(1, output_height, output_width, channels).permute(0, 3, 1, 2)
+    passing, message = check_with_pcc_without_tensor_printout(output, golden, pcc=0.995)
+    assert passing, message
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 1 << 15}], indirect=True)
+def test_quasar_depthwise_accepts_public_height_sharded_prepared_weight(device):
     channels = 64
     input_width = 10
     kernel_width = 4

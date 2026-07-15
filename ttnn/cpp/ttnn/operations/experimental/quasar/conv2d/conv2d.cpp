@@ -38,23 +38,6 @@
 #include "ttnn/operations/experimental/quasar/to_device/to_device.hpp"
 #include "ttnn/operations/sliding_window/sliding_window.hpp"
 
-namespace ttnn::operations::conv {
-// get_conv_padded_input_shape_and_mem_config has external linkage but is not declared in
-// conv2d_utils.hpp (only used within conv2d_utils.cpp originally). Forward-declare it so the quasar
-// shard_or_reshard fork can reuse it; resolves against conv2d_utils.cpp at link time.
-std::tuple<ttnn::Shape, ttnn::MemoryConfig, bool> get_conv_padded_input_shape_and_mem_config(
-    MeshDevice* device,
-    const ttnn::Tensor& input_tensor_,
-    const Conv2dConfig& conv_config,
-    uint32_t batch_size,
-    uint32_t height,
-    uint32_t width,
-    uint32_t in_channels,
-    uint32_t out_channels,
-    bool is_mm_conv,
-    bool require_tile_aligned_channels);
-}  // namespace ttnn::operations::conv
-
 namespace ttnn::operations::experimental::quasar::detail {
 
 // Shared conv host infrastructure (conv2d_utils.hpp, prepare_conv2d_weights.hpp) is reused from the
@@ -138,7 +121,7 @@ static ttnn::MemoryConfig offset_sharded_mem_config_qsr(const ttnn::MemoryConfig
 // (hence the quasar reshard + interleaved<->sharded kernels). The BLOCK_SHARDED mm-conv tilize workaround
 // (#13979) keeps the core to_layout, which quasar tilize does not yet replicate for block-sharded inputs.
 // Shared decision helpers (get_conv_padded_input_shape_and_mem_config, flatten_4d_shape, ...) are reused.
-static std::tuple<ttnn::Tensor, ParallelConfig, ParallelConfig> shard_or_reshard_tensor_if_required_qsr(
+static std::tuple<ttnn::Tensor, ParallelConfig, ParallelConfig, uint32_t> shard_or_reshard_tensor_if_required_qsr(
     MeshDevice* device,
     const ttnn::Tensor& input_tensor_,
     const Conv2dConfig& conv_config,
@@ -148,12 +131,13 @@ static std::tuple<ttnn::Tensor, ParallelConfig, ParallelConfig> shard_or_reshard
     uint32_t in_channels,
     uint32_t out_channels,
     bool is_mm_conv,
-    bool auto_shard) {
+    bool auto_shard,
+    bool is_1d_depthwise_conv) {
     ttnn::Tensor input_tensor = input_tensor_;  // tensor to return
     bool input_tensor_on_device = tt::tt_metal::is_device_tensor(input_tensor_);
     auto compute_grid_size = device->compute_with_storage_grid_size();
 
-    auto [input_padded_shape, input_tensor_sharded_memory_config, needs_shard_or_reshard] =
+    auto [input_padded_shape, input_tensor_sharded_memory_config, needs_shard_or_reshard, input_channels_padded] =
         get_conv_padded_input_shape_and_mem_config(
             device,
             input_tensor_,
@@ -164,7 +148,7 @@ static std::tuple<ttnn::Tensor, ParallelConfig, ParallelConfig> shard_or_reshard
             in_channels,
             out_channels,
             is_mm_conv,
-            false);
+            is_1d_depthwise_conv);
 
     // Honor the OFFSET of conv_config.core_grid (the shared helper honors only its size, always anchoring
     // at (0,0)). Shift the activation shard grid onto that origin so the conv runs on the requested cores
@@ -180,6 +164,9 @@ static std::tuple<ttnn::Tensor, ParallelConfig, ParallelConfig> shard_or_reshard
         .grid = input_tensor_sharded_memory_config.shard_spec().value().grid,
         .shard_scheme = input_tensor_sharded_memory_config.memory_layout(),
         .shard_orientation = input_tensor_sharded_memory_config.shard_spec().value().orientation};
+    TT_FATAL(
+        !is_1d_depthwise_conv || parallel_config.shard_scheme == TensorMemoryLayout::HEIGHT_SHARDED,
+        "Quasar 1D depthwise convolution supports HEIGHT_SHARDED layout only");
 
     auto output_compute_grid_size = get_output_compute_grid_size(compute_grid_size, conv_config, parallel_config);
     ParallelConfig output_parallel_config = determine_output_parallel_config(
@@ -261,7 +248,7 @@ static std::tuple<ttnn::Tensor, ParallelConfig, ParallelConfig> shard_or_reshard
                 input_tensor, device, (auto_shard_mm ? ttnn::DRAM_MEMORY_CONFIG : input_tensor_sharded_memory_config));
         }
     }
-    return {input_tensor, parallel_config, output_parallel_config};
+    return {input_tensor, parallel_config, output_parallel_config, input_channels_padded};
 }
 
 // Quasar variant of determine_matmul_op_config_from_conv_op_config (conv2d_utils): builds the
@@ -334,7 +321,12 @@ Result conv2d_L1(
     std::array<uint32_t, 4> padding_n4 = sliding_window::get_pair_n4_padding(padding);
     const auto& weight_tensor = weight_tensor_;
     std::optional<ttnn::Tensor> bias_tensor = bias_tensor_;
-    bool mm_conv = use_matmul_for_1x1_conv(kernel_size, stride, padding_n4, dilation, groups, conv_config);
+    const std::optional<MemoryConfig> input_sharded_memory_config =
+        tt::tt_metal::is_device_tensor(input_tensor_) && input_tensor_.is_sharded()
+            ? std::make_optional(input_tensor_.memory_config())
+            : std::nullopt;
+    bool mm_conv = use_matmul_for_1x1_conv(
+        kernel_size, stride, padding_n4, dilation, groups, conv_config, input_sharded_memory_config);
     // Store the original stride size for weight folding
     auto orig_stride = stride;
 
@@ -351,6 +343,16 @@ Result conv2d_L1(
         padding_n4,
         mm_conv,
         conv_config);
+    mm_conv = use_matmul_for_1x1_conv(
+        kernel_size,
+        stride,
+        padding_n4,
+        dilation,
+        groups,
+        conv_config,
+        tt::tt_metal::is_device_tensor(input_tensor) && input_tensor.is_sharded()
+            ? std::make_optional(input_tensor.memory_config())
+            : std::nullopt);
 
     if (conv_config.enable_activation_reuse) {
         if (conv_config.enable_act_double_buffer) {
@@ -414,35 +416,20 @@ Result conv2d_L1(
             false);
         auto_shard = true;
     }
-    const TensorMemoryLayout selected_shard_layout = get_effective_input_shard_layout(input_tensor, conv_config);
-    TT_FATAL(
-        !conv_is_1d_depthwise || selected_shard_layout != TensorMemoryLayout::BLOCK_SHARDED,
-        "Quasar 1D depthwise convolution does not support BLOCK_SHARDED layout");
     const bool should_deallocate_act = conv_config.deallocate_activation && !input_tensor.memory_config().is_dram();
-    auto [input_tensor_post_tm, parallel_config, output_parallel_config] = shard_or_reshard_tensor_if_required_qsr(
-        device,
-        input_tensor,
-        conv_config,
-        batch_size,
-        output_height,
-        output_width,
-        in_channels,
-        out_channels,
-        mm_conv,
-        auto_shard);
-    TT_FATAL(
-        !conv_is_1d_depthwise || parallel_config.shard_scheme == selected_shard_layout,
-        "Quasar 1D depthwise convolution input shard layout changed unexpectedly during resharding");
-
-    const uint32_t input_channels_alignment = get_input_channels_alignment(
-        input_tensor_post_tm.memory_config().memory_layout(),
-        input_tensor_post_tm.layout(),
-        false,
-        mm_conv,
-        input_tensor_post_tm.memory_config());
-    const uint32_t in_channels_padded = tt::round_up(
-        in_channels, get_num_cores_channels_from_parallel_config(parallel_config) * input_channels_alignment);
-
+    auto [input_tensor_post_tm, parallel_config, output_parallel_config, in_channels_padded] =
+        shard_or_reshard_tensor_if_required_qsr(
+            device,
+            input_tensor,
+            conv_config,
+            batch_size,
+            output_height,
+            output_width,
+            in_channels,
+            out_channels,
+            mm_conv,
+            auto_shard,
+            conv_is_1d_depthwise);
     const bool coalesce_1d_depthwise_kw_reads = should_coalesce_1d_depthwise_conv_reads(
         conv_is_1d_depthwise,
         parallel_config.shard_scheme,
@@ -471,7 +458,7 @@ Result conv2d_L1(
 
     // Configure weight and bias preparation parameters
     Conv2dWeightsBiasPrepConfig params(
-        input_channels_alignment,
+        in_channels_padded,
         conv_config.weights_dtype,
         opt_conv_op_block_config.act_block_w_ntiles,
         opt_conv_op_block_config.out_subblock_w_ntiles,
@@ -501,9 +488,8 @@ Result conv2d_L1(
         const uint32_t expected_depthwise_kernel_taps = kernel_size[0] * kernel_size[1];
         const uint32_t expected_depthwise_tap_height =
             opt_conv_op_block_config.act_block_h_ntiles * tt::constants::TILE_HEIGHT;
-        const uint32_t padded_out_channels = tt::round_up(
-            out_channels,
-            get_num_cores_channels_from_parallel_config(output_parallel_config) * tt::constants::TILE_WIDTH);
+        const uint32_t padded_out_channels = determine_conv_output_channels_padded(
+            parallel_config, output_parallel_config, in_channels_padded, out_channels, conv_is_1d_depthwise);
         const auto& logical_weight_shape = weight_tensor_on_device.logical_shape();
         const auto& padded_weight_shape = weight_tensor_on_device.padded_shape();
         const bool valid_legacy_depthwise_weights =
@@ -539,8 +525,8 @@ Result conv2d_L1(
             log_debug(tt::LogOp, "conv2d: Using preprocessed weights from device.");
         } else {
             TT_FATAL(
-                !conv_is_1d_depthwise || weight_tensor_on_device.layout() != Layout::TILE ||
-                    logical_weight_shape.rank() != 4 || logical_weight_shape[0] != 1,
+                !conv_is_1d_depthwise ||
+                    is_valid_device_raw_depthwise_conv1d_weights(weight_tensor_on_device, out_channels, kernel_size),
                 "Prepared 1D depthwise weights are incompatible with the current Quasar convolution plan");
             log_warning(
                 tt::LogOp,
@@ -1071,7 +1057,16 @@ Result conv2d_DRAM(
     Conv2dConfig conv_config = conv_config_.value_or(Conv2dConfig());
     const DataType output_dtype = dtype.value_or(input_tensor.dtype());
     std::array<uint32_t, 4> padding_n4 = sliding_window::get_pair_n4_padding(padding);
-    bool mm_conv = use_matmul_for_1x1_conv(kernel_size, stride, padding_n4, dilation, groups, conv_config);
+    bool mm_conv = use_matmul_for_1x1_conv(
+        kernel_size,
+        stride,
+        padding_n4,
+        dilation,
+        groups,
+        conv_config,
+        tt::tt_metal::is_device_tensor(input_tensor) && input_tensor.is_sharded()
+            ? std::make_optional(input_tensor.memory_config())
+            : std::nullopt);
     // Use weights_dtype from config if set, otherwise use weight tensor's dtype
     DataType weight_dtype = conv_config.weights_dtype.value_or(weight_tensor.dtype());
     DeviceComputeKernelConfig compute_config =
@@ -1094,6 +1089,16 @@ Result conv2d_DRAM(
         padding_n4,
         mm_conv,
         conv_config);
+    mm_conv = use_matmul_for_1x1_conv(
+        kernel_size,
+        stride,
+        padding_n4,
+        dilation,
+        groups,
+        conv_config,
+        tt::tt_metal::is_device_tensor(input_tensor_on_device) && input_tensor_on_device.is_sharded()
+            ? std::make_optional(input_tensor_on_device.memory_config())
+            : std::nullopt);
     if (!is_device_tensor(input_tensor_on_device)) {
         input_tensor_on_device =
             ttnn::operations::core::to_device(input_tensor_on_device, device, ttnn::DRAM_MEMORY_CONFIG);

@@ -33,6 +33,9 @@ bool is_valid_device_depthwise_conv1d_weights(
     uint32_t padded_out_channels,
     const std::optional<DataType>& expected_dtype);
 
+bool is_valid_device_raw_depthwise_conv1d_weights(
+    const ttnn::Tensor& weight_tensor, uint32_t out_channels, const std::array<uint32_t, 2>& kernel_size);
+
 bool is_valid_device_conv_bias(
     const ttnn::Tensor& bias_tensor, uint32_t out_channels, const std::optional<DataType>& expected_dtype);
 
@@ -131,11 +134,63 @@ ttnn::Tensor prepare_conv_bias(
     const std::optional<const DeviceComputeKernelConfig>& compute_config_,
     const std::optional<const Conv2dSliceConfig>& dram_slice_config_ = std::nullopt);
 
+// Internal entry points for lowered operations whose logical parameters can disallow the direct matmul path.
+namespace detail {
+
+ttnn::Tensor prepare_conv_weights(
+    const ttnn::Tensor& weight_tensor,
+    const ttnn::MemoryConfig& input_memory_config,
+    Layout input_layout,
+    const std::string& weights_format,
+    uint32_t in_channels,
+    uint32_t out_channels,
+    uint32_t batch_size,
+    uint32_t input_height,
+    uint32_t input_width,
+    std::array<uint32_t, 2> kernel_size,
+    std::array<uint32_t, 2> stride,
+    std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>> padding,
+    std::array<uint32_t, 2> dilation,
+    bool has_bias,
+    uint32_t groups,
+    MeshDevice* device,
+    DataType input_dtype,
+    const std::optional<const DataType>& output_dtype,
+    const std::optional<const Conv2dConfig>& conv_config_,
+    const std::optional<const DeviceComputeKernelConfig>& compute_config_,
+    const std::optional<const Conv2dSliceConfig>& dram_slice_config_,
+    bool allow_matmul,
+    bool use_depthwise_weight_plan_shape);
+
+ttnn::Tensor prepare_conv_bias(
+    const ttnn::Tensor& bias_tensor,
+    const ttnn::MemoryConfig& input_memory_config,
+    Layout input_layout,
+    uint32_t in_channels,
+    uint32_t out_channels,
+    uint32_t batch_size,
+    uint32_t input_height,
+    uint32_t input_width,
+    std::array<uint32_t, 2> kernel_size,
+    std::array<uint32_t, 2> stride,
+    std::variant<std::array<uint32_t, 2>, std::array<uint32_t, 4>> padding,
+    std::array<uint32_t, 2> dilation,
+    uint32_t groups,
+    MeshDevice* device,
+    DataType input_dtype,
+    const std::optional<const DataType>& output_dtype,
+    const std::optional<const Conv2dConfig>& conv_config_,
+    const std::optional<const DeviceComputeKernelConfig>& compute_config_,
+    const std::optional<const Conv2dSliceConfig>& dram_slice_config_,
+    bool allow_matmul);
+
+}  // namespace detail
+
 // Unified parameter struct for conv2d weight and bias preparation
 struct Conv2dWeightsBiasPrepConfig {
     // Constructor to ensure all required parameters are initialized
     Conv2dWeightsBiasPrepConfig(
-        uint32_t input_channels_alignment_,
+        uint32_t input_channels_padded_,
         std::optional<DataType> weights_bias_dtype_,
         uint32_t weight_block_h_ntiles_,
         uint32_t weight_block_w_ntiles_,
@@ -154,7 +209,7 @@ struct Conv2dWeightsBiasPrepConfig {
         bool coalesce_1d_depthwise_kw_reads_ = false,
         bool use_depthwise_weight_plan_shape_ = false,
         std::array<uint32_t, 2> stride_ = {1, 1}) :
-        input_channels_alignment(input_channels_alignment_),
+        input_channels_padded(input_channels_padded_),
         weights_bias_dtype(weights_bias_dtype_),
         weight_block_h_ntiles(weight_block_h_ntiles_),
         weight_block_w_ntiles(weight_block_w_ntiles_),
@@ -175,7 +230,7 @@ struct Conv2dWeightsBiasPrepConfig {
         out_channels(out_channels_) {}
 
     // Common parameters
-    const uint32_t input_channels_alignment;
+    const uint32_t input_channels_padded;
     const std::optional<DataType> weights_bias_dtype;
     uint32_t weight_block_h_ntiles;
     const uint32_t weight_block_w_ntiles;
@@ -203,7 +258,7 @@ struct Conv2dWeightsBiasPrepConfig {
     const uint32_t out_channels;
 
     static constexpr auto attribute_names = std::make_tuple(
-        "input_channels_alignment",
+        "input_channels_padded",
         "weights_bias_dtype",
         "weight_block_h_ntiles",
         "weight_block_w_ntiles",
@@ -224,7 +279,7 @@ struct Conv2dWeightsBiasPrepConfig {
         "out_channels");
     auto attribute_values() const {
         return std::make_tuple(
-            std::cref(this->input_channels_alignment),
+            std::cref(this->input_channels_padded),
             std::cref(this->weights_bias_dtype),
             std::cref(this->weight_block_h_ntiles),
             std::cref(this->weight_block_w_ntiles),

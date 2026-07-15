@@ -52,6 +52,9 @@ def run_conv_transpose2d(
     config_tensors_in_dram=False,
     dram_slice_config=None,
     fast_compare=True,
+    input_memory_config=None,
+    reshard_if_not_optimal=False,
+    expected_memory_layout=None,
 ):
     torch.manual_seed(0)
     conv_input_shape = [batch_size, input_channels, input_height, input_width]
@@ -89,6 +92,8 @@ def run_conv_transpose2d(
         )
 
     tt_input_tensor = ttnn.from_torch(torch_input_tensor, activations_dtype, layout=layout, device=device)
+    if input_memory_config is not None:
+        tt_input_tensor = ttnn.to_memory_config(tt_input_tensor, input_memory_config)
 
     if auto_shard:
         shard_layout = None
@@ -100,6 +105,7 @@ def run_conv_transpose2d(
         enable_act_double_buffer=enable_act_double_buffer,
         output_layout=layout,
         config_tensors_in_dram=config_tensors_in_dram,
+        reshard_if_not_optimal=reshard_if_not_optimal,
     )
     compute_config = ttnn.init_device_compute_kernel_config(
         device.arch(),
@@ -113,9 +119,15 @@ def run_conv_transpose2d(
     if config_override and "act_block_w_div" in config_override:
         conv_config.act_block_w_div = config_override["act_block_w_div"]
     if preprocess_weights_bias:
+        prep_input_memory_config = (
+            input_memory_config
+            if input_memory_config is not None
+            else (ttnn.DRAM_MEMORY_CONFIG if dram_slice_config is not None else ttnn.L1_MEMORY_CONFIG)
+        )
+        prep_input_layout = layout if input_memory_config is not None else ttnn.ROW_MAJOR_LAYOUT
         tt_weight_tensor = ttnn.prepare_conv_transpose2d_weights(
             weight_tensor=tt_weight_tensor,
-            input_memory_config=ttnn.DRAM_MEMORY_CONFIG if dram_slice_config is not None else ttnn.L1_MEMORY_CONFIG,
+            input_memory_config=prep_input_memory_config,
             input_layout=layout,
             weights_format="IOHW",
             in_channels=input_channels,
@@ -141,8 +153,8 @@ def run_conv_transpose2d(
         tt_bias_tensor = (
             ttnn.prepare_conv_transpose2d_bias(
                 bias_tensor=tt_bias_tensor,
-                input_memory_config=ttnn.L1_MEMORY_CONFIG,
-                input_layout=ttnn.ROW_MAJOR_LAYOUT,
+                input_memory_config=prep_input_memory_config,
+                input_layout=prep_input_layout,
                 in_channels=input_channels,
                 out_channels=output_channels,
                 batch_size=batch_size,
@@ -187,6 +199,8 @@ def run_conv_transpose2d(
         return_weights_and_bias=True,
         dtype=activations_dtype,
     )
+    if expected_memory_layout is not None:
+        assert tt_output_tensor_on_device.memory_config().memory_layout == expected_memory_layout
     logger.info(f"Conv2d Transpose Input = {(input_height, input_width)} Output = {out_height, out_width}")
 
     torch_output_tensor = ttnn.to_torch((tt_output_tensor_on_device).cpu())

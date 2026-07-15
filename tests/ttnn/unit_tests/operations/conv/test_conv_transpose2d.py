@@ -21,6 +21,135 @@ from tests.ttnn.nightly.unit_tests.operations.conv.test_conv_transpose2d import 
 
 
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 64 * 1024}], indirect=True)
+@pytest.mark.parametrize("preprocess_weights", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_conv_transpose2d_1x1_preserves_pre_sharded_width_input(device, preprocess_weights, has_bias):
+    input_memory_config = ttnn.create_sharded_memory_config(
+        (1, 1, 64, 128),
+        core_grid=ttnn.CoreGrid(x=4, y=1),
+        strategy=ttnn.ShardStrategy.WIDTH,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    run_conv_transpose2d(
+        device=device,
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        activations_dtype=ttnn.bfloat16,
+        weights_dtype=ttnn.bfloat16,
+        batch_size=1,
+        output_channels=64,
+        input_channels=128,
+        input_height=8,
+        input_width=8,
+        filter_height=1,
+        filter_width=1,
+        stride_h=1,
+        stride_w=1,
+        pad_h=0,
+        pad_w=0,
+        out_pad_h=0,
+        out_pad_w=0,
+        shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        input_memory_config=input_memory_config,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        has_bias=has_bias,
+        preprocess_weights_bias=preprocess_weights,
+        expected_memory_layout=ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+    )
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 64 * 1024}], indirect=True)
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_conv_transpose2d_1x1_stride2_prepared_parameters_match_runtime(device, has_bias):
+    run_conv_transpose2d(
+        device=device,
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        activations_dtype=ttnn.bfloat16,
+        weights_dtype=ttnn.bfloat16,
+        batch_size=1,
+        output_channels=64,
+        input_channels=64,
+        input_height=8,
+        input_width=8,
+        filter_height=1,
+        filter_width=1,
+        stride_h=2,
+        stride_w=2,
+        pad_h=0,
+        pad_w=0,
+        out_pad_h=0,
+        out_pad_w=0,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        has_bias=has_bias,
+        auto_shard=True,
+        preprocess_weights_bias=True,
+        input_memory_config=ttnn.L1_MEMORY_CONFIG,
+        fast_compare=False,
+    )
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 64 * 1024}], indirect=True)
+@pytest.mark.parametrize("preprocess_weights", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_conv_transpose2d_1x1_dram_input_uses_matmul_parameter_layout(device, preprocess_weights, has_bias):
+    run_conv_transpose2d(
+        device=device,
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        activations_dtype=ttnn.bfloat16,
+        weights_dtype=ttnn.bfloat16,
+        batch_size=1,
+        output_channels=64,
+        input_channels=64,
+        input_height=8,
+        input_width=8,
+        filter_height=1,
+        filter_width=1,
+        stride_h=1,
+        stride_w=1,
+        pad_h=0,
+        pad_w=0,
+        out_pad_h=0,
+        out_pad_w=0,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        has_bias=has_bias,
+        auto_shard=True,
+        preprocess_weights_bias=preprocess_weights,
+        input_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        fast_compare=False,
+    )
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 64 * 1024}], indirect=True)
+@pytest.mark.parametrize("preprocess_weights", [False, True])
+def test_conv_transpose2d_1d_depthwise_prepared_weights_match_runtime(device, preprocess_weights):
+    run_conv_transpose2d(
+        device=device,
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        activations_dtype=ttnn.bfloat16,
+        weights_dtype=ttnn.bfloat16,
+        batch_size=1,
+        output_channels=1,
+        input_channels=1,
+        input_height=1,
+        input_width=8,
+        filter_height=1,
+        filter_width=3,
+        stride_h=1,
+        stride_w=1,
+        pad_h=0,
+        pad_w=1,
+        out_pad_h=0,
+        out_pad_w=0,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        groups=1,
+        has_bias=False,
+        auto_shard=True,
+        preprocess_weights_bias=preprocess_weights,
+        input_memory_config=ttnn.L1_MEMORY_CONFIG,
+        fast_compare=False,
+    )
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 64 * 1024}], indirect=True)
 @pytest.mark.parametrize(
     "batch_size, input_height, input_width, input_channels, output_channels, filter_height, filter_width, stride_h, stride_w, pad_h, pad_w, out_pad_h, out_pad_w, config, shard_layout",
     (

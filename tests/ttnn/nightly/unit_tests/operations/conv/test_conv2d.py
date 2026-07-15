@@ -136,6 +136,7 @@ def run_conv(
     force_split_reader=None,
     core_grid=None,
     perf_test_mode=False,
+    expected_memory_layout=None,
 ):
     if isinstance(device, ttnn.MeshDevice) and len(device.get_device_ids()) > 1:
         assert input_mesh_mapper is not None, "Expected mesh mapper for input tensor when running on multiple devices"
@@ -337,6 +338,9 @@ def run_conv(
             slice_config=slice_config,
         )
     ttnn.synchronize_device(device)
+
+    if expected_memory_layout is not None:
+        assert tt_output_tensor_on_device.memory_config().memory_layout == expected_memory_layout
 
     if not perf_test_mode:
         tt_output_tensor = ttnn.from_device(tt_output_tensor_on_device)

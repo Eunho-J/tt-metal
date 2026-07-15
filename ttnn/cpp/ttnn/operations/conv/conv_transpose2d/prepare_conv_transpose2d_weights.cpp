@@ -25,8 +25,8 @@ using namespace ttnn::operations::sliding_window;
 
 namespace ttnn::operations::conv::conv_transpose2d {
 
-using ttnn::operations::conv::conv2d::prepare_conv_bias;
-using ttnn::operations::conv::conv2d::prepare_conv_weights;
+using ttnn::operations::conv::conv2d::detail::prepare_conv_bias;
+using ttnn::operations::conv::conv2d::detail::prepare_conv_weights;
 using ttnn::prim::Conv2dConfig;
 using ttnn::prim::Conv2dSliceConfig;
 
@@ -187,6 +187,14 @@ ttnn::Tensor prepare_conv_transpose2d_weights(
     auto padding_n4 = sliding_window::get_pair_n4_padding(padding);
     DataType conv_output_dtype = output_dtype.value_or(input_dtype);
     Conv2dConfig conv_config = conv_config_.value_or(Conv2dConfig());
+    const bool allow_matmul = use_matmul_for_1x1_conv(
+        kernel_size,
+        stride,
+        padding_n4,
+        dilation,
+        groups,
+        conv_config,
+        input_memory_config.is_sharded() ? std::make_optional(input_memory_config) : std::nullopt);
     // Use weights_dtype from config if set, otherwise use weight tensor's dtype
     DataType weight_dtype = conv_config.weights_dtype.value_or(weight_tensor.dtype());
     DeviceComputeKernelConfig compute_config =
@@ -210,10 +218,10 @@ ttnn::Tensor prepare_conv_transpose2d_weights(
         groups_for_prep = 1;
     }
 
-    // When auto-slicing is enabled (num_slices=0), determine the actual slice config first
-    // so we can decide the execution path based on the auto-determined value
+    // Non-matmul auto-slicing must be resolved before selecting the execution path.
+    // Matmul follows the runtime's direct L1 planning path and does not consume a slice plan.
     std::optional<Conv2dSliceConfig> actual_slice_config = dram_slice_config_;
-    if (dram_slice_config_.has_value() && dram_slice_config_.value().num_slices == 0) {
+    if (!allow_matmul && dram_slice_config_.has_value() && dram_slice_config_.value().num_slices == 0) {
         // Need to auto-determine - create temporary structures.
         // output_padding must match the value the conv op will use so that the auto-determined
         // slice count agrees between weight preparation and the actual conv. A mismatch (e.g.
@@ -272,8 +280,10 @@ ttnn::Tensor prepare_conv_transpose2d_weights(
     }
 
     // Determine execution path based on configuration and input properties
-    ConvT2dExecutionPath path = determine_conv_transpose2d_execution_path(
-        tt::tt_metal::StorageType::DEVICE, input_memory_config, actual_slice_config);
+    ConvT2dExecutionPath path = allow_matmul
+                                    ? ConvT2dExecutionPath::L1
+                                    : determine_conv_transpose2d_execution_path(
+                                          tt::tt_metal::StorageType::DEVICE, input_memory_config, actual_slice_config);
 
     Tensor mirrored_weight_tensor = transform_weights_for_conv_transpose2d(weight_for_transform, mirror_kernel);
     if (path == ConvT2dExecutionPath::L1) {
@@ -303,7 +313,9 @@ ttnn::Tensor prepare_conv_transpose2d_weights(
             output_dtype,
             conv_config_,
             compute_config_,
-            op_slicing::Op2DSliceConfig{.slice_type = op_slicing::Op2DSliceConfig::SliceType::L1_FULL});
+            op_slicing::Op2DSliceConfig{.slice_type = op_slicing::Op2DSliceConfig::SliceType::L1_FULL},
+            allow_matmul,
+            false);
     }
 
     // DRAM path continues - need to set up slice configuration
@@ -409,7 +421,9 @@ ttnn::Tensor prepare_conv_transpose2d_weights(
         output_dtype,
         conv_config_,
         compute_config_,
-        op_slicing::Op2DSliceConfig{.slice_type = op_slicing::Op2DSliceConfig::SliceType::L1_FULL});
+        op_slicing::Op2DSliceConfig{.slice_type = op_slicing::Op2DSliceConfig::SliceType::L1_FULL},
+        allow_matmul,
+        false);
 }
 
 ttnn::Tensor prepare_conv_transpose2d_bias(
@@ -438,6 +452,20 @@ ttnn::Tensor prepare_conv_transpose2d_bias(
     auto dims =
         compute_conv_transpose2d_dimensions(input_height, input_width, kernel_size, stride, padding, {0, 0}, dilation);
     const uint32_t groups_for_prep = groups > 1 ? 1 : groups;
+    const auto padding_n4 = sliding_window::get_pair_n4_padding(padding);
+    const Conv2dConfig conv_config = conv_config_.value_or(Conv2dConfig());
+    const bool allow_matmul = use_matmul_for_1x1_conv(
+        kernel_size,
+        stride,
+        padding_n4,
+        dilation,
+        groups,
+        conv_config,
+        input_memory_config.is_sharded() ? std::make_optional(input_memory_config) : std::nullopt);
+    const std::optional<const Conv2dSliceConfig> prep_slice_config =
+        allow_matmul ? std::optional<const Conv2dSliceConfig>(
+                           Conv2dSliceConfig{.slice_type = op_slicing::Op2DSliceConfig::SliceType::L1_FULL})
+                     : dram_slice_config_;
 
     return prepare_conv_bias(
         bias_tensor,
@@ -458,7 +486,8 @@ ttnn::Tensor prepare_conv_transpose2d_bias(
         output_dtype,
         conv_config_,
         compute_config_,
-        dram_slice_config_);
+        prep_slice_config,
+        allow_matmul);
 }
 
 }  // namespace ttnn::operations::conv::conv_transpose2d

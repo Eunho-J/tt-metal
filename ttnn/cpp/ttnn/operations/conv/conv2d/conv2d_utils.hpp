@@ -37,11 +37,31 @@ uint32_t find_closest_largest_divisor_with_num_padding(uint32_t num1, uint32_t n
 uint32_t get_input_channels_alignment(
     TensorMemoryLayout input_tensor_memory_layout,
     Layout input_tensor_layout,
-    bool sliced_op,
+    BufferType input_tensor_buffer_type,
     bool is_mm_conv,
-    const std::optional<MemoryConfig>& input_memory_config);
+    const std::optional<MemoryConfig>& input_memory_config,
+    std::optional<uint32_t> l1_alignment_bytes = std::nullopt);
 
-TensorMemoryLayout get_effective_input_shard_layout(const ttnn::Tensor& input_tensor, const Conv2dConfig& conv_config);
+struct ConvInputShardPlan {
+    sliding_window::ParallelConfig parallel_config;
+    uint32_t input_channels_padded;
+    bool needs_shard_or_reshard;
+};
+
+ConvInputShardPlan determine_conv_input_parallel_config(
+    const CoreCoord& compute_grid_size,
+    const std::optional<MemoryConfig>& input_memory_config,
+    const Conv2dConfig& conv_config,
+    uint32_t batch_size,
+    uint32_t output_height,
+    uint32_t output_width,
+    uint32_t in_channels,
+    uint32_t out_channels,
+    Layout input_layout,
+    bool is_mm_conv,
+    bool is_1d_depthwise_conv,
+    uint32_t l1_alignment_bytes,
+    uint32_t input_tensor_channels_padded);
 
 CoreCoord get_output_compute_grid_size(
     const CoreCoord& device_compute_grid_size,
@@ -54,7 +74,8 @@ bool use_matmul_for_1x1_conv(
     const std::array<uint32_t, 4>& padding,
     const std::array<uint32_t, 2>& dilation,
     uint32_t groups,
-    const Conv2dConfig& conv_config);
+    const Conv2dConfig& conv_config,
+    const std::optional<MemoryConfig>& input_memory_config = std::nullopt);
 
 bool is_1d_conv(uint32_t kernel_height, uint32_t image_height);
 
@@ -131,6 +152,13 @@ uint32_t get_num_cores_channels_from_parallel_config(const sliding_window::Paral
 MemoryConfig create_sharded_memory_config_from_parallel_config(
     const ttnn::Shape& tensor_shape, const sliding_window::ParallelConfig& parallel_config, uint32_t tile_size);
 
+uint32_t determine_conv_output_channels_padded(
+    const sliding_window::ParallelConfig& input_parallel_config,
+    const sliding_window::ParallelConfig& output_parallel_config,
+    uint32_t input_channels_padded,
+    uint32_t output_channels,
+    bool is_1d_depthwise_conv);
+
 Conv2dParallelizationConfig determine_conv_op_parallel_config_from_conv_output_mem_config(
     const MemoryConfig& conv_output_mem_config,
     uint32_t num_cores_nhw,
@@ -191,7 +219,20 @@ std::tuple<ttnn::Shape, ttnn::MemoryConfig> determine_input_memory_config(
     bool enable_channels_padding = true,
     bool is_shard_height_tile_multiple = true,
     bool is_shard_width_tile_multiple = true,
-    bool require_tile_aligned_channels = false);
+    bool require_tile_aligned_channels = false,
+    std::optional<uint32_t> input_channels_padded = std::nullopt);
+
+std::tuple<ttnn::Shape, ttnn::MemoryConfig, bool, uint32_t> get_conv_padded_input_shape_and_mem_config(
+    MeshDevice* device,
+    const ttnn::Tensor& input_tensor,
+    const Conv2dConfig& conv_config,
+    uint32_t batch_size,
+    uint32_t height,
+    uint32_t width,
+    uint32_t in_channels,
+    uint32_t out_channels,
+    bool is_mm_conv,
+    bool is_1d_depthwise_conv);
 
 DeviceComputeKernelConfig get_conv_default_compute_kernel_config(
     MeshDevice* device, DataType input_dtype, DataType weight_dtype);
@@ -257,7 +298,7 @@ Conv2dConfig determine_conv_config_for_auto_shard(
 
 ttnn::Shape flatten_4d_shape(const ttnn::Shape& input_shape);
 
-std::tuple<ttnn::Tensor, sliding_window::ParallelConfig, sliding_window::ParallelConfig>
+std::tuple<ttnn::Tensor, sliding_window::ParallelConfig, sliding_window::ParallelConfig, uint32_t>
 shard_or_reshard_tensor_if_required(
     MeshDevice* device,
     const ttnn::Tensor& input_tensor_,
@@ -269,7 +310,7 @@ shard_or_reshard_tensor_if_required(
     uint32_t out_channels,
     bool is_mm_conv,
     bool auto_shard,
-    bool require_tile_aligned_channels);
+    bool is_1d_depthwise_conv);
 
 bool auto_enable_kernel_folding(
     const ttnn::MemoryConfig& input_memory_config,

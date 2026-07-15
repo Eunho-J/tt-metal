@@ -12,8 +12,11 @@
 #include "ttnn/common/queue_id.hpp"
 #include "ttnn/device.hpp"
 #include "ttnn/tensor/tensor.hpp"
+#include "ttnn/operations/conv/conv1d/conv1d.hpp"
 #include "ttnn/operations/conv/conv2d/conv2d.hpp"
+#include "ttnn/operations/conv/conv2d/conv2d_utils.hpp"
 #include "ttnn/operations/conv/conv_types.hpp"
+#include "ttnn/operations/data_movement/fold/fold.hpp"
 #include "ttnn/operations/data_movement/permute/permute.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/operations/data_movement/untilize/untilize.hpp"
@@ -38,6 +41,289 @@ struct Conv2DParam {
 };
 
 class Conv2DFixture : public ::testing::Test, public testing::WithParamInterface<Conv2DParam> {};
+
+TEST(Conv2DFoldPlannerTest, PreservesPhysicalChannelsInHeightShardedFold) {
+    const auto input_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{0, 0}}};
+    const auto input_memory_config = MemoryConfig{
+        TensorMemoryLayout::HEIGHT_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{input_grid, {64, 8}, ShardOrientation::ROW_MAJOR}};
+
+    const auto folded_layout = data_movement::determine_folded_tensor_layout(
+        Shape({1, 8, 8, 3}), input_memory_config, 2, 2, {0, 0, 0, 0}, CoreCoord{13, 10});
+
+    EXPECT_EQ(folded_layout.layout, Layout::ROW_MAJOR);
+    EXPECT_EQ(folded_layout.memory_config.memory_layout(), TensorMemoryLayout::HEIGHT_SHARDED);
+    ASSERT_TRUE(folded_layout.memory_config.shard_spec().has_value());
+    EXPECT_EQ(folded_layout.memory_config.shard_spec()->grid, input_grid);
+    EXPECT_EQ(folded_layout.memory_config.shard_spec()->shape, (std::array<uint32_t, 2>{16, 32}));
+
+    const auto folded_spec = TensorSpec(
+        Shape({1, 4, 4, 12}), TensorLayout(DataType::BFLOAT16, Layout::ROW_MAJOR, folded_layout.memory_config));
+    EXPECT_EQ(folded_spec.padded_shape()[-1], 32);
+}
+
+TEST(Conv2DFoldPlannerTest, MatchesHaloShardHeightForBatchedPadding) {
+    const auto input_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{3, 0}}};
+    const auto input_memory_config = MemoryConfig{
+        TensorMemoryLayout::HEIGHT_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{input_grid, {1, 8}, ShardOrientation::ROW_MAJOR}};
+
+    const auto folded_layout = data_movement::determine_folded_tensor_layout(
+        Shape({3, 1, 1, 8}), input_memory_config, 2, 1, {0, 1, 0, 0}, CoreCoord{13, 10});
+
+    EXPECT_EQ(folded_layout.layout, Layout::ROW_MAJOR);
+    ASSERT_TRUE(folded_layout.memory_config.shard_spec().has_value());
+    EXPECT_EQ(folded_layout.memory_config.shard_spec()->grid, input_grid);
+    EXPECT_EQ(folded_layout.memory_config.shard_spec()->shape, (std::array<uint32_t, 2>{1, 16}));
+}
+
+TEST(Conv2DFoldPlannerTest, RejectsUnsupportedShardedLayout) {
+    const auto input_memory_config = MemoryConfig{
+        TensorMemoryLayout::BLOCK_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{
+            CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{1, 0}}}, {32, 32}, ShardOrientation::ROW_MAJOR}};
+
+    EXPECT_THROW(
+        (void)data_movement::determine_folded_tensor_layout(
+            Shape({1, 8, 8, 64}), input_memory_config, 2, 2, {0, 0, 0, 0}, CoreCoord{13, 10}),
+        std::runtime_error);
+
+    const auto missing_shard_spec = MemoryConfig{TensorMemoryLayout::HEIGHT_SHARDED, BufferType::L1};
+    EXPECT_THROW(
+        (void)data_movement::determine_folded_tensor_layout(
+            Shape({1, 8, 8, 64}), missing_shard_spec, 2, 2, {0, 0, 0, 0}, CoreCoord{13, 10}),
+        std::runtime_error);
+}
+
+TEST(Conv1DContractTest, RejectsInputShapeMismatchedWithParametersWithoutOpeningDevice) {
+    const auto input_shape = Shape{2, 17, 96};
+    const auto weight_shape = Shape{96, 1, 4};
+    const auto input_spec = TensorSpec(input_shape, TensorLayout(DataType::FLOAT32, Layout::ROW_MAJOR, MemoryConfig{}));
+    const auto weight_spec =
+        TensorSpec(weight_shape, TensorLayout(DataType::FLOAT32, Layout::ROW_MAJOR, MemoryConfig{}));
+    const auto input = Tensor::from_vector(std::vector<float>(input_shape.volume()), input_spec);
+    const auto weight = Tensor::from_vector(std::vector<float>(weight_shape.volume()), weight_spec);
+
+    EXPECT_THROW(
+        (void)ttnn::conv1d(
+            input,
+            weight,
+            /*device=*/nullptr,
+            /*in_channels=*/96,
+            /*out_channels=*/96,
+            /*batch_size=*/1,
+            /*input_length=*/17,
+            /*kernel_size=*/4),
+        std::runtime_error);
+}
+
+TEST(Conv2DInputPlannerTest, ReshardOptimalityUsesCanonicalChannelAlignment) {
+    const CoreCoord compute_grid{13, 10};
+
+    const auto existing_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{1, 7}}};
+    const auto existing_memory_config = MemoryConfig{
+        TensorMemoryLayout::BLOCK_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{existing_grid, {32, 32}, ShardOrientation::ROW_MAJOR}};
+    Conv2dConfig conv_config;
+    conv_config.shard_layout = TensorMemoryLayout::BLOCK_SHARDED;
+    conv_config.reshard_if_not_optimal = true;
+
+    const auto input_plan = determine_conv_input_parallel_config(
+        compute_grid,
+        existing_memory_config,
+        conv_config,
+        /*batch_size=*/1,
+        /*output_height=*/1,
+        /*output_width=*/256,
+        /*in_channels=*/64,
+        /*out_channels=*/64,
+        Layout::ROW_MAJOR,
+        /*is_mm_conv=*/false,
+        /*is_1d_depthwise_conv=*/false,
+        /*l1_alignment_bytes=*/16,
+        /*input_tensor_channels_padded=*/64);
+
+    EXPECT_TRUE(input_plan.needs_shard_or_reshard);
+    EXPECT_EQ(input_plan.input_channels_padded, 64);
+    EXPECT_EQ(input_plan.parallel_config.shard_scheme, TensorMemoryLayout::BLOCK_SHARDED);
+    EXPECT_EQ(input_plan.parallel_config.shard_orientation, ShardOrientation::ROW_MAJOR);
+    EXPECT_EQ(input_plan.parallel_config.grid.bounding_box().grid_size(), (CoreCoord{8, 8}));
+}
+
+TEST(Conv2DInputPlannerTest, ReshardPreservesPhysicalChannelPadding) {
+    const CoreCoord compute_grid{13, 10};
+
+    const auto existing_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{0, 0}}};
+    const auto existing_memory_config = MemoryConfig{
+        TensorMemoryLayout::HEIGHT_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{existing_grid, {32, 40}, ShardOrientation::ROW_MAJOR}};
+    Conv2dConfig conv_config;
+    conv_config.shard_layout = TensorMemoryLayout::HEIGHT_SHARDED;
+    conv_config.override_sharding_config = true;
+    conv_config.core_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{1, 0}}};
+
+    const auto input_plan = determine_conv_input_parallel_config(
+        compute_grid,
+        existing_memory_config,
+        conv_config,
+        /*batch_size=*/1,
+        /*output_height=*/1,
+        /*output_width=*/30,
+        /*in_channels=*/24,
+        /*out_channels=*/32,
+        Layout::ROW_MAJOR,
+        /*is_mm_conv=*/false,
+        /*is_1d_depthwise_conv=*/false,
+        /*l1_alignment_bytes=*/16,
+        /*input_tensor_channels_padded=*/40);
+
+    EXPECT_TRUE(input_plan.needs_shard_or_reshard);
+    EXPECT_EQ(input_plan.input_channels_padded, 40);
+    EXPECT_EQ(input_plan.parallel_config.grid, conv_config.core_grid.value());
+}
+
+TEST(Conv2DInputPlannerTest, DepthwiseBlockReshardPreservesShardWidthAndTrimsInactiveCores) {
+    const CoreCoord compute_grid{13, 10};
+
+    const auto existing_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{3, 0}}};
+    const auto existing_memory_config = MemoryConfig{
+        TensorMemoryLayout::BLOCK_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{existing_grid, {32, 64}, ShardOrientation::ROW_MAJOR}};
+    Conv2dConfig conv_config;
+    conv_config.shard_layout = TensorMemoryLayout::BLOCK_SHARDED;
+
+    const auto input_plan = determine_conv_input_parallel_config(
+        compute_grid,
+        existing_memory_config,
+        conv_config,
+        /*batch_size=*/1,
+        /*output_height=*/1,
+        /*output_width=*/29,
+        /*in_channels=*/96,
+        /*out_channels=*/96,
+        Layout::ROW_MAJOR,
+        /*is_mm_conv=*/false,
+        /*is_1d_depthwise_conv=*/true,
+        /*l1_alignment_bytes=*/16,
+        /*input_tensor_channels_padded=*/128);
+
+    EXPECT_TRUE(input_plan.needs_shard_or_reshard);
+    EXPECT_EQ(input_plan.input_channels_padded, 128);
+    EXPECT_EQ(input_plan.parallel_config.shard_scheme, TensorMemoryLayout::BLOCK_SHARDED);
+    EXPECT_EQ(get_num_cores_channels_from_parallel_config(input_plan.parallel_config), 2);
+}
+
+TEST(Conv2DInputPlannerTest, DepthwiseBlockOutputPreservesInputChannelPartitionCapacity) {
+    const CoreCoord compute_grid{13, 10};
+    const auto source_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{3, 0}}};
+    const auto source_memory_config = MemoryConfig{
+        TensorMemoryLayout::BLOCK_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{source_grid, {32, 96}, ShardOrientation::ROW_MAJOR}};
+    Conv2dConfig conv_config;
+    conv_config.shard_layout = TensorMemoryLayout::BLOCK_SHARDED;
+
+    const auto input_plan = determine_conv_input_parallel_config(
+        compute_grid,
+        source_memory_config,
+        conv_config,
+        /*batch_size=*/1,
+        /*output_height=*/1,
+        /*output_width=*/29,
+        /*in_channels=*/100,
+        /*out_channels=*/100,
+        Layout::ROW_MAJOR,
+        /*is_mm_conv=*/false,
+        /*is_1d_depthwise_conv=*/true,
+        /*l1_alignment_bytes=*/16,
+        /*input_tensor_channels_padded=*/192);
+    const auto output_plan = determine_output_parallel_config(
+        input_plan.parallel_config,
+        compute_grid,
+        /*out_channels=*/100,
+        ShardOrientation::ROW_MAJOR,
+        /*is_mm_conv=*/false,
+        /*require_input_channel_partition=*/true);
+
+    EXPECT_EQ(get_num_cores_channels_from_parallel_config(input_plan.parallel_config), 2);
+    EXPECT_EQ(input_plan.input_channels_padded, 192);
+    EXPECT_EQ(
+        determine_conv_output_channels_padded(
+            input_plan.parallel_config,
+            output_plan,
+            input_plan.input_channels_padded,
+            /*output_channels=*/100,
+            /*is_1d_depthwise_conv=*/true),
+        192);
+}
+
+TEST(Conv2DInputPlannerTest, DepthwiseBlockPreservesFullyPopulatedCustomWidthInput) {
+    const CoreCoord compute_grid{13, 10};
+    const auto source_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{1, 0}}};
+    const auto source_memory_config = MemoryConfig{
+        TensorMemoryLayout::BLOCK_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{source_grid, {32, 96}, ShardOrientation::ROW_MAJOR}};
+    Conv2dConfig conv_config;
+    conv_config.shard_layout = TensorMemoryLayout::BLOCK_SHARDED;
+
+    const auto input_plan = determine_conv_input_parallel_config(
+        compute_grid,
+        source_memory_config,
+        conv_config,
+        /*batch_size=*/1,
+        /*output_height=*/1,
+        /*output_width=*/29,
+        /*in_channels=*/100,
+        /*out_channels=*/100,
+        Layout::ROW_MAJOR,
+        /*is_mm_conv=*/false,
+        /*is_1d_depthwise_conv=*/true,
+        /*l1_alignment_bytes=*/16,
+        /*input_tensor_channels_padded=*/192);
+
+    EXPECT_FALSE(input_plan.needs_shard_or_reshard);
+    EXPECT_EQ(input_plan.parallel_config.grid, source_grid);
+    EXPECT_EQ(input_plan.input_channels_padded, 192);
+}
+
+TEST(Conv2DInputPlannerTest, CrossLayoutReshardUsesCanonicalChannelPadding) {
+    const CoreCoord compute_grid{13, 10};
+
+    const auto existing_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{3, 0}}};
+    const auto existing_memory_config = MemoryConfig{
+        TensorMemoryLayout::BLOCK_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{existing_grid, {32, 32}, ShardOrientation::ROW_MAJOR}};
+    Conv2dConfig conv_config;
+    conv_config.shard_layout = TensorMemoryLayout::HEIGHT_SHARDED;
+    conv_config.reshard_if_not_optimal = true;
+
+    const auto input_plan = determine_conv_input_parallel_config(
+        compute_grid,
+        existing_memory_config,
+        conv_config,
+        /*batch_size=*/1,
+        /*output_height=*/1,
+        /*output_width=*/29,
+        /*in_channels=*/96,
+        /*out_channels=*/96,
+        Layout::ROW_MAJOR,
+        /*is_mm_conv=*/false,
+        /*is_1d_depthwise_conv=*/false,
+        /*l1_alignment_bytes=*/16,
+        /*input_tensor_channels_padded=*/96);
+
+    EXPECT_TRUE(input_plan.needs_shard_or_reshard);
+    EXPECT_EQ(input_plan.input_channels_padded, 96);
+    EXPECT_EQ(input_plan.parallel_config.shard_scheme, TensorMemoryLayout::HEIGHT_SHARDED);
+}
 
 /*
     Reference implementation of Conv2D

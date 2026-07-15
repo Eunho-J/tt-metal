@@ -4,6 +4,7 @@
 
 #include "fold_device_op.hpp"
 #include "ttnn/device_operation.hpp"
+#include "ttnn/operations/data_movement/fold/fold.hpp"
 #include "ttnn/tensor/tensor_ops.hpp"
 
 namespace ttnn::operations::data_movement {
@@ -54,8 +55,7 @@ Fold::spec_return_value_t Fold::compute_output_specs(
     auto input_dtype = input_tensor.dtype();
 
     tt::tt_metal::DataType output_dtype =
-        (input_dtype == tt::tt_metal::DataType::FLOAT32 ||
-         input_dtype == tt::tt_metal::DataType::UINT16)
+        (input_dtype == tt::tt_metal::DataType::FLOAT32 || input_dtype == tt::tt_metal::DataType::UINT16)
             ? input_dtype
             : tt::tt_metal::DataType::BFLOAT16;
 
@@ -67,11 +67,8 @@ Fold::spec_return_value_t Fold::compute_output_specs(
          input_shape[3] * op_attr.stride_h * op_attr.stride_w});
 
     if (op_attr.is_sharded) {
-        auto shard_spec = input_tensor.shard_spec().value();
-        shard_spec.shape[0] /= op_attr.stride_h * op_attr.stride_w;
-        shard_spec.shape[1] *= op_attr.stride_h * op_attr.stride_w;
-        auto mem_config = MemoryConfig(
-            input_tensor.memory_config().memory_layout(), input_tensor.memory_config().buffer_type(), shard_spec);
+        const auto mem_config =
+            determine_fold_output_memory_config(input_tensor.memory_config(), op_attr.stride_h, op_attr.stride_w);
 
         return {TensorSpec(
             output_shape,

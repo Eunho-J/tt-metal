@@ -26,7 +26,8 @@ using Conv1dResult = std::variant<
 
 // Conv1d is a wrapper around conv2d to handle 1D convolutions.
 // It uses the same logic as conv2d but with 1D-specific parameters.
-// The input and weight tensors are reshaped to 4D tensors before invoking conv2d.
+// Rank-3 [N, L, C] inputs are viewed as [N, 1, L, C] before invoking conv2d. Rank-4 [N, H, W, C] inputs retain their
+// shape and must have N*H*W equal to batch_size*input_length. Weight tensors are reshaped to 4D before invoking conv2d.
 Conv1dResult conv1d(
     const ttnn::Tensor& input_tensor,
     const ttnn::Tensor& weight_tensor,

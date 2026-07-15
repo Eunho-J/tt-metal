@@ -7,6 +7,43 @@ from tests.ttnn.nightly.unit_tests.operations.conv.test_conv2d import run_conv, 
 import ttnn
 
 
+@pytest.mark.parametrize("configured_shard_layout", [None, HS], ids=["unset", "height"])
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 16384}], indirect=True)
+def test_conv2d_1x1_preserves_pre_sharded_width_input(device, torch_tensor_map, configured_shard_layout):
+    input_channels = 128
+    input_height = 8
+    input_width = 8
+    input_memory_config = ttnn.create_sharded_memory_config(
+        (1, 1, input_height * input_width, input_channels),
+        core_grid=ttnn.CoreGrid(x=4, y=1),
+        strategy=ttnn.ShardStrategy.WIDTH,
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+    )
+
+    run_conv(
+        device=device,
+        torch_tensor_map=torch_tensor_map,
+        math_fidelity=ttnn.MathFidelity.HiFi4,
+        output_dtype=ttnn.bfloat16,
+        weights_dtype=ttnn.bfloat16,
+        batch_size=1,
+        output_channels=64,
+        input_channels=input_channels,
+        input_height=input_height,
+        input_width=input_width,
+        filter_height=1,
+        filter_width=1,
+        stride_h=1,
+        stride_w=1,
+        padding=0,
+        config_override=None,
+        shard_layout=configured_shard_layout,
+        has_bias=False,
+        sharded_cfg=input_memory_config,
+        expected_memory_layout=ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+    )
+
+
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 16384}], indirect=True)
 @pytest.mark.parametrize("stride", [2])
 @pytest.mark.parametrize("batch_size", [2])

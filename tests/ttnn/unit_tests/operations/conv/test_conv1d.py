@@ -896,9 +896,12 @@ def run_conv1d_route(
     return_prepared_weight=False,
     expected_memory_layout=None,
     expected_shard_width=None,
+    expected_num_cores=None,
     weight_on_device=False,
     input_memory_config=None,
+    input_padded_shape=None,
     transpose_shards=False,
+    reshard_if_not_optimal=False,
 ):
     """Run ttnn.conv1d and check it against the torch golden.
 
@@ -923,17 +926,37 @@ def run_conv1d_route(
     if golden_activation is not None:
         golden = golden_activation(golden)
 
-    input_tt = ttnn.from_torch(
-        torch_input_ncl.permute(0, 2, 1),  # NLC for conv1d
-        dtype=activations_dtype,
-        layout=ttnn.ROW_MAJOR_LAYOUT,
-        device=device,
-        memory_config=(
-            input_memory_config
-            if input_memory_config is not None
-            else (ttnn.DRAM_MEMORY_CONFIG if input_in_dram else ttnn.L1_MEMORY_CONFIG)
-        ),
+    input_memory_config = (
+        input_memory_config
+        if input_memory_config is not None
+        else (ttnn.DRAM_MEMORY_CONFIG if input_in_dram else ttnn.L1_MEMORY_CONFIG)
     )
+    torch_input_nlc = torch_input_ncl.permute(0, 2, 1)
+    if input_padded_shape is None:
+        input_tt = ttnn.from_torch(
+            torch_input_nlc,
+            dtype=activations_dtype,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=device,
+            memory_config=input_memory_config,
+        )
+    else:
+        torch_input_padded = torch.zeros(input_padded_shape, dtype=torch_input_nlc.dtype)
+        torch_input_padded[:batch_size, :input_length, :in_channels] = torch_input_nlc
+        input_tt = ttnn.from_torch(
+            torch_input_padded,
+            dtype=activations_dtype,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+        )
+        input_tt = ttnn.reshape(
+            input_tt,
+            (batch_size, input_length, in_channels),
+            padded_shape=input_padded_shape,
+        )
+        input_tt = ttnn.to_device(input_tt, device, memory_config=input_memory_config)
+        assert tuple(input_tt.shape) == (batch_size, input_length, in_channels)
+        assert tuple(input_tt.padded_shape) == tuple(input_padded_shape)
+        assert ttnn.is_tensor_storage_on_device(input_tt)
     weight_tt = prepared_weight
     if weight_tt is None:
         weight_tt = ttnn.from_torch(
@@ -951,6 +974,7 @@ def run_conv1d_route(
         config_tensors_in_dram=config_tensors_in_dram,
         activation=fused_activation,
         transpose_shards=transpose_shards,
+        reshard_if_not_optimal=reshard_if_not_optimal,
     )
     if act_block_h is not None:
         conv_config.act_block_h_override = act_block_h
@@ -990,10 +1014,13 @@ def run_conv1d_route(
         output_memory_config = tt_out.memory_config()
         assert output_memory_config.memory_layout == expected_memory_layout
         assert output_memory_config.shard_spec is not None
-        assert output_memory_config.shard_spec.shape[1] < out_channels
+        if expected_memory_layout == ttnn.TensorMemoryLayout.BLOCK_SHARDED:
+            assert output_memory_config.shard_spec.shape[1] < out_channels
         assert output_memory_config.shard_spec.shape[1] % ttnn.TILE_SIZE == 0
     if expected_shard_width is not None:
         assert tt_out.memory_config().shard_spec.shape[1] == expected_shard_width
+    if expected_num_cores is not None:
+        assert tt_out.memory_config().shard_spec.grid.num_cores() == expected_num_cores
 
     out = ttnn.to_torch(tt_out).reshape(batch_size, out_length, out_channels).permute(0, 2, 1)
     passing, pcc_msg = check_with_pcc_without_tensor_printout(out, golden, pcc=pcc)
@@ -1239,6 +1266,39 @@ def test_conv1d_depthwise_preserves_pre_sharded_block_channel_partition(device):
 
 
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 1 << 15}], indirect=True)
+def test_conv1d_rank3_preserves_padded_sharded_device_input(device):
+    batch_size = 1
+    input_length = 17
+    input_channels = 96
+    output_channels = 128
+    input_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))})
+    input_memory_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(input_grid, (32, 128), ttnn.ShardOrientation.ROW_MAJOR),
+    )
+
+    run_conv1d_route(
+        device=device,
+        batch_size=batch_size,
+        in_channels=input_channels,
+        out_channels=output_channels,
+        input_length=input_length,
+        kernel_size=4,
+        stride=1,
+        padding=0,
+        groups=1,
+        shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        input_in_dram=False,
+        input_memory_config=input_memory_config,
+        input_padded_shape=(batch_size, input_length, 128),
+        expected_memory_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        expected_shard_width=output_channels,
+        pcc=0.995,
+    )
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 1 << 15}], indirect=True)
 @pytest.mark.parametrize(
     "weights_dtype,output_dtype,pcc,transpose_shards,config_tensors_in_dram",
     [
@@ -1320,6 +1380,73 @@ def test_conv1d_depthwise_rejects_pre_sharded_width_input_with_height_config(dev
             input_in_dram=False,
             input_memory_config=input_memory_config,
         )
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 1 << 15}], indirect=True)
+def test_conv1d_depthwise_reshards_padded_block_input_to_height(device):
+    channels = 96
+    input_length = 32
+    input_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 0))})
+    input_memory_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.BLOCK_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(input_grid, (32, 32), ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    common_args = dict(
+        device=device,
+        batch_size=1,
+        in_channels=channels,
+        out_channels=channels,
+        input_length=input_length,
+        kernel_size=4,
+        stride=1,
+        padding=0,
+        groups=channels,
+        shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        input_in_dram=False,
+        input_memory_config=input_memory_config,
+        reshard_if_not_optimal=True,
+        expected_memory_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        expected_shard_width=channels,
+        pcc=0.995,
+    )
+
+    _, prepared_weight = run_conv1d_route(**common_args, return_prepared_weight=True)
+    run_conv1d_route(**common_args, prepared_weight=prepared_weight)
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 1 << 15}], indirect=True)
+def test_conv1d_depthwise_preserves_padded_block_width_and_trims_inactive_cores(device):
+    channels = 100
+    input_length = 32
+    input_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 0))})
+    input_memory_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.BLOCK_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(input_grid, (32, 96), ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    common_args = dict(
+        device=device,
+        batch_size=1,
+        in_channels=channels,
+        out_channels=channels,
+        input_length=input_length,
+        kernel_size=4,
+        stride=1,
+        padding=0,
+        groups=channels,
+        shard_layout=ttnn.TensorMemoryLayout.BLOCK_SHARDED,
+        input_in_dram=False,
+        input_memory_config=input_memory_config,
+        input_padded_shape=(1, input_length, 192),
+        expected_memory_layout=ttnn.TensorMemoryLayout.BLOCK_SHARDED,
+        expected_shard_width=96,
+        expected_num_cores=2,
+        pcc=0.995,
+    )
+
+    _, prepared_weight = run_conv1d_route(**common_args, return_prepared_weight=True)
+    run_conv1d_route(**common_args, prepared_weight=prepared_weight)
 
 
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 1 << 15}], indirect=True)
