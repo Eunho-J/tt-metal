@@ -413,6 +413,35 @@ def test_prepare_conv_weights_matches_dram_sliced_tile_plan(device, has_bias, nu
     )
 
 
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 32768}], indirect=True)
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_prepare_conv_weights_matches_dram_height_tile_width_padding_plan(device, has_bias):
+    prepare_conv_weights_func(
+        batch_size=1,
+        output_channels=64,
+        input_channels=24,
+        input_height=64,
+        input_width=50,
+        filter_height=3,
+        filter_width=3,
+        stride_h=1,
+        stride_w=1,
+        pad_h=1,
+        pad_w=1,
+        config_override=None,
+        device=device,
+        groups=1,
+        is_owned=False,
+        slice_config=ttnn.Conv2dSliceConfig(
+            slice_type=ttnn.Conv2dDRAMSliceHeight,
+            num_slices=2,
+        ),
+        input_layout=ttnn.TILE_LAYOUT,
+        has_bias=has_bias,
+        weights_dtype=ttnn.bfloat16,
+    )
+
+
 @pytest.mark.parametrize(
     "batch_size, output_channels, input_channels, input_height, input_width, filter_height, filter_width, stride_h, stride_w, pad_h, pad_w,  config_override, groups",
     (
@@ -784,8 +813,9 @@ def test_prepare_conv_weights_with_fold(
 
 
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 8192}], indirect=True)
+@pytest.mark.parametrize("input_num_cores", [1, 2], ids=["compact", "overprovisioned"])
 @pytest.mark.parametrize("has_bias", [False, True])
-def test_prepare_conv_weights_matches_height_sharded_fold_plan(device, has_bias):
+def test_prepare_conv_weights_matches_height_sharded_fold_plan(device, has_bias, input_num_cores):
     torch.manual_seed(0)
     batch_size = 1
     input_height = 8
@@ -800,7 +830,9 @@ def test_prepare_conv_weights_matches_height_sharded_fold_plan(device, has_bias)
     torch_bias = torch.randn(output_channels, dtype=torch.bfloat16).float() if has_bias else None
     golden = torch.nn.functional.conv2d(torch_input, torch_weight, bias=torch_bias, stride=stride)
 
-    input_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))})
+    input_grid = ttnn.CoreRangeSet(
+        {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(input_num_cores - 1, 0))}
+    )
     input_memory_config = ttnn.MemoryConfig(
         ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
         ttnn.BufferType.L1,

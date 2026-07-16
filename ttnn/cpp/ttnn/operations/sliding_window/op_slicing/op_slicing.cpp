@@ -25,12 +25,41 @@ static uint32_t compute_slice_rounding_value(
 }
 
 // Compute the maximum number of slices allowed for the given output dimension and layout.
-static uint32_t compute_max_num_slices(
-    uint32_t output_sliced_dim, uint32_t slice_rounding_value, tt::tt_metal::Layout output_layout) {
+uint32_t get_max_num_slices(
+    uint32_t output_sliced_dim, tt::tt_metal::Layout output_layout, Op2DSliceConfig::SliceType slice_type) {
+    const uint32_t slice_rounding_value = compute_slice_rounding_value(output_layout, slice_type);
     if (output_layout == tt::tt_metal::Layout::TILE) {
         return tt::div_up(output_sliced_dim, slice_rounding_value);
     }
     return output_sliced_dim;
+}
+
+OutputSliceRange get_output_slice_range(
+    uint32_t output_sliced_dim,
+    tt::tt_metal::Layout output_layout,
+    const Op2DSliceConfig& slice_config,
+    uint32_t slice_index) {
+    const uint32_t slice_rounding_value = compute_slice_rounding_value(output_layout, slice_config.slice_type);
+    const uint32_t output_slice_units = tt::div_up(output_sliced_dim, slice_rounding_value);
+    const uint32_t min_output_slice_units = output_slice_units / slice_config.num_slices;
+    const uint32_t output_slice_rem = output_slice_units % slice_config.num_slices;
+    const uint32_t output_slice_start =
+        slice_rounding_value * (slice_index * min_output_slice_units + std::min(slice_index, output_slice_rem));
+    const uint32_t output_slice_size =
+        slice_rounding_value * (min_output_slice_units + (slice_index < output_slice_rem ? 1 : 0));
+    return {
+        .start = std::min(output_sliced_dim, output_slice_start),
+        .end = std::min(output_sliced_dim, output_slice_start + output_slice_size)};
+}
+
+void validate_slice_config(
+    uint32_t output_sliced_dim, tt::tt_metal::Layout output_layout, const Op2DSliceConfig& slice_config) {
+    const uint32_t max_num_slices = get_max_num_slices(output_sliced_dim, output_layout, slice_config.slice_type);
+    TT_FATAL(
+        slice_config.num_slices <= max_num_slices,
+        "Number of slices ({}) exceeds the maximum allowed ({}) for the given output dimension and alignment.",
+        slice_config.num_slices,
+        max_num_slices);
 }
 
 static uint32_t compute_L1_usage_for_slice_config(
@@ -48,34 +77,19 @@ static uint32_t compute_L1_usage_for_slice_config(
     const uint32_t output_sliced_dim =
         dram_slice_config.slice_type == Op2DSliceConfig::SliceType::DRAM_HEIGHT ? output_height : output_width;
 
-    const uint32_t slice_rounding_value = compute_slice_rounding_value(output_layout, dram_slice_config.slice_type);
-
-    const uint32_t min_output_slice_size =
-        tt::div_up(output_sliced_dim, slice_rounding_value) / dram_slice_config.num_slices;
-    const uint32_t output_slice_rem =
-        tt::div_up(output_sliced_dim, slice_rounding_value) % dram_slice_config.num_slices;
-
     uint32_t max_memory_consumed = 0;
-    uint32_t slice_index = 0;
-    uint32_t output_slice_dim_start = 0;
-
-    while ((output_slice_dim_start < output_sliced_dim) && (slice_index < dram_slice_config.num_slices)) {
-        const uint32_t output_slice_size =
-            slice_rounding_value * (min_output_slice_size + ((slice_index < output_slice_rem) ? 1 : 0));
-        const uint32_t output_slice_dim_end = std::min(output_sliced_dim, output_slice_dim_start + output_slice_size);
-        const uint32_t this_output_slice_dim = output_slice_dim_end - output_slice_dim_start;
-
-        if (this_output_slice_dim == 0) {
-            // No work to be done in this iteration, so skip it.
-            slice_index++;
+    for (uint32_t slice_index = 0; slice_index < dram_slice_config.num_slices; ++slice_index) {
+        const auto output_slice_range =
+            get_output_slice_range(output_sliced_dim, output_layout, dram_slice_config, slice_index);
+        if (output_slice_range.start == output_slice_range.end) {
             continue;
         }
 
         uint32_t output_slice_height_start, output_slice_height_end, input_slice_height_start, input_slice_height_end;
         uint32_t output_slice_width_start, output_slice_width_end, input_slice_width_start, input_slice_width_end;
         if (dram_slice_config.slice_type == Op2DSliceConfig::SliceType::DRAM_HEIGHT) {
-            output_slice_height_start = output_slice_dim_start;
-            output_slice_height_end = output_slice_dim_end;
+            output_slice_height_start = output_slice_range.start;
+            output_slice_height_end = output_slice_range.end;
             output_slice_width_start = 0;
             output_slice_width_end = output_width;
             auto [input_slice_start, input_slice_end] = op_slice_attr->get_input_slice(
@@ -90,15 +104,13 @@ static uint32_t compute_L1_usage_for_slice_config(
             input_slice_height_start = std::max<int>(0, input_slice_height_start);
             input_slice_height_end = std::min<int>(input_height, input_slice_height_end);
             if (input_slice_height_start >= input_slice_height_end) {
-                // No work to be done in this iteration, so skip it.
-                slice_index++;
                 continue;
             }
         } else {
             output_slice_height_start = 0;
             output_slice_height_end = output_height;
-            output_slice_width_start = output_slice_dim_start;
-            output_slice_width_end = output_slice_dim_end;
+            output_slice_width_start = output_slice_range.start;
+            output_slice_width_end = output_slice_range.end;
 
             auto [input_slice_start, input_slice_end] = op_slice_attr->get_input_slice(
                 {output_slice_height_start, output_slice_width_start},
@@ -110,8 +122,6 @@ static uint32_t compute_L1_usage_for_slice_config(
             input_slice_width_end = std::min<int>(input_width, input_slice_width_end);
 
             if (input_slice_width_start >= input_slice_width_end) {
-                // No work to be done in this iteration, so skip it.
-                slice_index++;
                 continue;
             }
         }
@@ -122,8 +132,6 @@ static uint32_t compute_L1_usage_for_slice_config(
                 {output_slice_height_start, output_slice_width_start},
                 {output_slice_height_end, output_slice_width_end},
                 dram_slice_config));
-        output_slice_dim_start += output_slice_size;
-        slice_index++;
     }
     return max_memory_consumed;
 }
@@ -188,13 +196,12 @@ static Op2DSliceConfig determine_slice_config_internal(
         output_width,
         auto_slice_type);
 
-    const uint32_t slice_rounding_value = compute_slice_rounding_value(output_layout, return_slice_config.slice_type);
-
     // DRAM_HEIGHT = slice along image height, DRAM_WIDTH = slice along image width
     const uint32_t output_sliced_dim =
         return_slice_config.slice_type == Op2DSliceConfig::SliceType::DRAM_HEIGHT ? output_height : output_width;
 
-    const uint32_t max_num_slices = compute_max_num_slices(output_sliced_dim, slice_rounding_value, output_layout);
+    const uint32_t max_num_slices =
+        get_max_num_slices(output_sliced_dim, output_layout, return_slice_config.slice_type);
 
     log_debug(
         tt::LogOp,
@@ -313,7 +320,8 @@ void run_sliced_op(
             dram_slice_config_,
             output_layout,
             input_tensor.device());
-        log_debug(tt::LogOp, "Auto determined DRAM Slice Config as {} for {}", dram_slice_config, op_slice_attr->name());
+        log_debug(
+            tt::LogOp, "Auto determined DRAM Slice Config as {} for {}", dram_slice_config, op_slice_attr->name());
 
         // If auto-determination resulted in num_slices==1, convert to L1_FULL to avoid DRAM slicing overhead
         // A single slice means the entire operation fits in L1, so we should use the L1 path instead
@@ -337,13 +345,11 @@ void run_sliced_op(
 
     log_debug(tt::LogOp, "{} DRAM with Slice Config {}", op_slice_attr->name(), dram_slice_config);
 
-    const uint32_t slice_rounding_value = compute_slice_rounding_value(output_layout, dram_slice_config.slice_type);
-
     // DRAM_HEIGHT = slice along image height, DRAM_WIDTH = slice along image width
     const uint32_t output_sliced_dim =
         dram_slice_config.slice_type == Op2DSliceConfig::SliceType::DRAM_HEIGHT ? output_height : output_width;
 
-    const uint32_t max_num_slices = compute_max_num_slices(output_sliced_dim, slice_rounding_value, output_layout);
+    const uint32_t max_num_slices = get_max_num_slices(output_sliced_dim, output_layout, dram_slice_config.slice_type);
 
     if (max_num_slices == 1) {
         log_debug(
@@ -355,11 +361,7 @@ void run_sliced_op(
             output_layout,
             dram_slice_config.slice_type);
     }
-    TT_FATAL(
-        dram_slice_config.num_slices <= max_num_slices,
-        "Number of slices ({}) exceeds the maximum allowed ({}) for the given output dimension and alignment.",
-        dram_slice_config.num_slices,
-        max_num_slices);
+    validate_slice_config(output_sliced_dim, output_layout, dram_slice_config);
 
     if (dram_slice_config.num_slices == 1) {
         for (auto& this_output_tensor : output_tensors) {
@@ -378,31 +380,18 @@ void run_sliced_op(
         return;
     }
 
-    const uint32_t min_output_slice_size =
-        tt::div_up(output_sliced_dim, slice_rounding_value) / dram_slice_config.num_slices;
-    const uint32_t output_slice_rem =
-        tt::div_up(output_sliced_dim, slice_rounding_value) % dram_slice_config.num_slices;
-
-    uint32_t slice_index = 0;
-    uint32_t output_slice_dim_start = 0;
-
-    while ((output_slice_dim_start < output_sliced_dim) && (slice_index < dram_slice_config.num_slices)) {
-        const uint32_t output_slice_size =
-            slice_rounding_value * (min_output_slice_size + ((slice_index < output_slice_rem) ? 1 : 0));
-        const uint32_t output_slice_dim_end = std::min(output_sliced_dim, output_slice_dim_start + output_slice_size);
-        const uint32_t this_output_slice_dim = output_slice_dim_end - output_slice_dim_start;
-
-        if (this_output_slice_dim == 0) {
-            // No work to be done in this iteration, so skip it.
-            slice_index++;
+    for (uint32_t slice_index = 0; slice_index < dram_slice_config.num_slices; ++slice_index) {
+        const auto output_slice_range =
+            get_output_slice_range(output_sliced_dim, output_layout, dram_slice_config, slice_index);
+        if (output_slice_range.start == output_slice_range.end) {
             continue;
         }
 
         uint32_t output_slice_height_start, output_slice_height_end, input_slice_height_start, input_slice_height_end;
         uint32_t output_slice_width_start, output_slice_width_end, input_slice_width_start, input_slice_width_end;
         if (dram_slice_config.slice_type == Op2DSliceConfig::SliceType::DRAM_HEIGHT) {
-            output_slice_height_start = output_slice_dim_start;
-            output_slice_height_end = output_slice_dim_end;
+            output_slice_height_start = output_slice_range.start;
+            output_slice_height_end = output_slice_range.end;
             output_slice_width_start = 0;
             output_slice_width_end = output_width;
             auto [input_slice_start, input_slice_end] = op_slice_attr->get_input_slice(
@@ -417,15 +406,13 @@ void run_sliced_op(
             input_slice_height_start = std::max<int>(0, input_slice_height_start);
             input_slice_height_end = std::min<int>(input_height, input_slice_height_end);
             if (input_slice_height_start >= input_slice_height_end) {
-                // No work to be done in this iteration, so skip it.
-                slice_index++;
                 continue;
             }
         } else {
             output_slice_height_start = 0;
             output_slice_height_end = output_height;
-            output_slice_width_start = output_slice_dim_start;
-            output_slice_width_end = output_slice_dim_end;
+            output_slice_width_start = output_slice_range.start;
+            output_slice_width_end = output_slice_range.end;
 
             auto [input_slice_start, input_slice_end] = op_slice_attr->get_input_slice(
                 {output_slice_height_start, output_slice_width_start},
@@ -439,8 +426,6 @@ void run_sliced_op(
             input_slice_width_end = std::min<int>(input_width, input_slice_width_end);
 
             if (input_slice_width_start >= input_slice_width_end) {
-                // No work to be done in this iteration, so skip it.
-                slice_index++;
                 continue;
             }
         }
@@ -527,8 +512,6 @@ void run_sliced_op(
                     batch_size, output_slice_height_end, output_slice_width_end, output_channels},
                 ttsl::SmallVector<uint32_t>{1, 1, 1, 1});
         }
-        output_slice_dim_start += output_slice_size;
-        slice_index++;
     }
 }
 }  // namespace ttnn::operations::op_slicing

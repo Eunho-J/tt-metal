@@ -305,23 +305,12 @@ ConvInputShardPlan determine_conv_input_parallel_config(
                                           target_parallel_config.shard_scheme == TensorMemoryLayout::HEIGHT_SHARDED;
     // The height-to-height reshard factory copies rows at a common physical width.
     const bool preserve_height_shard_width =
-        height_to_height_reshard && existing_input_channels_padded.value() >= in_channels;
+        height_to_height_reshard && existing_input_channels_padded.value() >= in_channels &&
+        existing_input_channels_padded.value() % target_input_channels_alignment == 0;
     const uint32_t target_input_channels_padded =
         preserve_height_shard_width
             ? existing_input_channels_padded.value()
             : tt::round_up(in_channels, target_num_cores_channels * target_input_channels_alignment);
-
-    if (is_1d_depthwise_conv && has_existing_shards &&
-        input_memory_config->memory_layout() == TensorMemoryLayout::BLOCK_SHARDED &&
-        target_parallel_config.shard_scheme == TensorMemoryLayout::BLOCK_SHARDED) {
-        const uint32_t target_shard_width = target_input_channels_padded / target_num_cores_channels;
-        TT_FATAL(
-            input_memory_config->shard_spec()->shape[1] == target_shard_width,
-            "1D depthwise BLOCK_SHARDED reshard requires equal source and target shard widths. Source/target widths: "
-            "{}/{}",
-            input_memory_config->shard_spec()->shape[1],
-            target_shard_width);
-    }
 
     if (existing_shards_are_valid && input_parallel_config.value() == target_parallel_config &&
         existing_input_channels_padded.value() == target_input_channels_padded) {
@@ -501,6 +490,77 @@ std::tuple<uint32_t, uint32_t> calculate_output_image_size(
                                    stride[1]) +
                                   1;
     return {output_height, output_width};
+}
+
+Conv2dSlicePlan determine_conv2d_slice_plan(
+    std::array<uint32_t, 2> input_shape,
+    std::array<uint32_t, 2> output_start,
+    std::array<uint32_t, 2> output_end,
+    std::array<uint32_t, 2> kernel_size,
+    std::array<uint32_t, 2> stride,
+    std::array<uint32_t, 4> padding,
+    std::array<uint32_t, 2> dilation,
+    Layout output_layout) {
+    int64_t input_height_start = static_cast<int64_t>(output_start[0]) * stride[0] - static_cast<int64_t>(padding[0]);
+    int64_t input_height_end =
+        (static_cast<int64_t>(output_end[0]) - 1) * stride[0] - static_cast<int64_t>(padding[0]) +
+        (static_cast<int64_t>(kernel_size[0]) - 1) * (static_cast<int64_t>(dilation[0]) - 1) + kernel_size[0];
+    int64_t input_width_start = static_cast<int64_t>(output_start[1]) * stride[1] - static_cast<int64_t>(padding[2]);
+    int64_t input_width_end = (static_cast<int64_t>(output_end[1]) - 1) * stride[1] - static_cast<int64_t>(padding[2]) +
+                              (static_cast<int64_t>(kernel_size[1]) - 1) * (static_cast<int64_t>(dilation[1]) - 1) +
+                              kernel_size[1];
+
+    std::array<uint32_t, 4> slice_padding = {
+        static_cast<uint32_t>(std::max<int64_t>(0, -input_height_start)),
+        static_cast<uint32_t>(std::max<int64_t>(0, input_height_end - input_shape[0])),
+        static_cast<uint32_t>(std::max<int64_t>(0, -input_width_start)),
+        static_cast<uint32_t>(std::max<int64_t>(0, input_width_end - input_shape[1]))};
+
+    input_height_start = std::max<int64_t>(0, input_height_start);
+    input_height_end = std::min<int64_t>(input_shape[0], input_height_end);
+    input_width_start = std::max<int64_t>(0, input_width_start);
+    input_width_end = std::min<int64_t>(input_shape[1], input_width_end);
+
+    const auto [output_height, output_width] =
+        calculate_output_image_size(input_shape, kernel_size, stride, padding, dilation);
+    if (output_start[0] == 0) {
+        slice_padding[0] = padding[0];
+        input_height_start = 0;
+    }
+    if (output_end[0] == output_height) {
+        slice_padding[1] = padding[1];
+        input_height_end = input_shape[0];
+    }
+    if (output_start[1] == 0) {
+        slice_padding[2] = padding[2];
+        input_width_start = 0;
+    }
+    if (output_end[1] == output_width) {
+        slice_padding[3] = padding[3];
+        input_width_end = input_shape[1];
+    }
+
+    const uint32_t input_slice_height = input_height_end - input_height_start;
+    const uint32_t input_slice_width = input_width_end - input_width_start;
+    const uint32_t output_slice_width = output_end[1] - output_start[1];
+    const uint32_t width_rounding_value = output_layout == Layout::TILE ? tt::constants::TILE_HEIGHT : 1;
+    const bool single_slice = input_slice_height == input_shape[0] && input_slice_width == input_shape[1];
+    if (output_slice_width % width_rounding_value != 0 && !single_slice) {
+        const uint32_t additional_padded_width = width_rounding_value - (output_slice_width % width_rounding_value);
+        log_trace(
+            tt::LogOp,
+            "Conv2d DRAM Slicing: Additional padding of {} added to the right side.",
+            additional_padded_width);
+        slice_padding[3] += additional_padded_width * stride[1];
+    }
+
+    const auto [local_output_height, local_output_width] = calculate_output_image_size(
+        {input_slice_height, input_slice_width}, kernel_size, stride, slice_padding, dilation);
+    return {
+        .input_start = {static_cast<uint32_t>(input_height_start), static_cast<uint32_t>(input_width_start)},
+        .input_end = {static_cast<uint32_t>(input_height_end), static_cast<uint32_t>(input_width_end)},
+        .padding = slice_padding,
+        .output_shape = {local_output_height, local_output_width}};
 }
 
 std::tuple<uint32_t, uint32_t> calculate_ct2d_output_image_size(
@@ -1642,8 +1702,8 @@ Tensor fold_input_tensor_if_required(
     if (conv_config.enable_kernel_stride_folding.value() && (stride[0] > 1 || stride[1] > 1)) {
         auto folding_result = compute_kernel_stride_folding_params(
             input_height, input_width, in_channels, kernel_size, stride, padding_n4, conv_config);
-        auto folded_input_tensor = fold_tensor(
-            input_tensor, device, stride, kernel_size, padding_n4, batch_size, input_height, input_width, in_channels);
+        auto folded_input_tensor =
+            fold_tensor(input_tensor, device, stride, kernel_size, padding_n4, batch_size, input_height, input_width);
         if (conv_config.deallocate_activation && !input_tensor.memory_config().is_dram()) {
             auto tensor_to_deallocate = input_tensor;
             tensor_to_deallocate.deallocate(true);
@@ -1670,8 +1730,7 @@ ttnn::Tensor fold_tensor(
     std::array<uint32_t, 4> padding_n4,
     uint32_t batch_size,
     uint32_t input_height,
-    uint32_t input_width,
-    uint32_t in_channels) {
+    uint32_t input_width) {
     // Validation checks
     TT_FATAL(
         stride[0] <= kernel_size[0] && stride[1] <= kernel_size[1],
@@ -1683,13 +1742,23 @@ ttnn::Tensor fold_tensor(
         tensor_on_device = ttnn::to_device(tensor_on_device, device, ttnn::DRAM_MEMORY_CONFIG);
     }
 
+    if (tensor_on_device.is_sharded() && tensor_on_device.logical_shape()[-1] != tensor_on_device.padded_shape()[-1]) {
+        const auto& shape = tensor_on_device.logical_shape();
+        tensor_on_device = ttnn::pad(
+            tensor_on_device,
+            tt::tt_metal::Array4D{
+                shape[0], shape[1], shape[2], static_cast<uint32_t>(tensor_on_device.padded_shape()[-1])},
+            tt::tt_metal::Array4D{0, 0, 0, 0},
+            0);
+    }
+
     // Reshape tensor from flattened 4D shape (e.g., [1, 1, N*H*W, C]) back to original 4D shape [N, H, W, C] before
     // folding
     const auto& current_shape = tensor_on_device.logical_shape();
     bool needs_reshape =
         (current_shape.rank() == 4 && (current_shape[1] != input_height || current_shape[2] != input_width));
     if (needs_reshape) {
-        const auto unflattened_shape = ttnn::Shape{batch_size, input_height, input_width, in_channels};
+        const auto unflattened_shape = ttnn::Shape{batch_size, input_height, input_width, current_shape[3]};
         tensor_on_device = ttnn::reshape(tensor_on_device, unflattened_shape, unflattened_shape);
     }
 
@@ -1747,7 +1816,12 @@ std::ostream& operator<<(std::ostream& os, const Conv2dConfig& config) {
 
 void tilize_with_optional_deallocation(Tensor& input_tensor_on_device, bool deallocate) {
     if (input_tensor_on_device.layout() != Layout::TILE) {
+        const auto logical_shape = input_tensor_on_device.logical_shape();
         Tensor input_tensor_tilized = ttnn::to_layout(input_tensor_on_device, Layout::TILE);
+        if (input_tensor_tilized.logical_shape() != logical_shape) {
+            input_tensor_tilized =
+                ttnn::reshape(input_tensor_tilized, logical_shape, input_tensor_tilized.padded_shape());
+        }
         if (deallocate) {
             input_tensor_on_device.deallocate(/*force*/ true);
         }

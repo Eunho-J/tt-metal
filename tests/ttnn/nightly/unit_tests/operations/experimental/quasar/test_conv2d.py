@@ -168,3 +168,55 @@ def test_quasar_depthwise_accepts_public_height_sharded_prepared_weight(device):
     second_passing, second_message = check_with_pcc_without_tensor_printout(second_output, golden, pcc=0.995)
     assert first_passing, first_message
     assert second_passing, second_message
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 1 << 15}], indirect=True)
+def test_quasar_kernel_stride_fold_preserves_physical_channel_groups(device):
+    torch.manual_seed(0)
+    input_channels = 3
+    output_channels = 32
+    input_height = 16
+    input_width = 16
+    kernel_size = (4, 4)
+    stride = (2, 2)
+    torch_input = torch.randn(1, input_channels, input_height, input_width, dtype=torch.bfloat16).float()
+    torch_weight = torch.randn(output_channels, input_channels, *kernel_size, dtype=torch.bfloat16).float()
+    golden = torch.nn.functional.conv2d(torch_input, torch_weight, stride=stride)
+
+    input_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 0))})
+    input_memory_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(input_grid, (input_height * input_width // 2, 8), ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    input_tt = ttnn.from_torch(
+        torch_input.permute(0, 2, 3, 1),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=device,
+        memory_config=input_memory_config,
+    )
+    weight_tt = ttnn.from_torch(torch_weight, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+    conv_config = ttnn.Conv2dConfig(
+        weights_dtype=ttnn.bfloat16,
+        shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        enable_kernel_stride_folding=True,
+    )
+
+    output_tt, [output_height, output_width] = ttnn.experimental.quasar.conv2d(
+        input_tensor=input_tt,
+        weight_tensor=weight_tt,
+        device=device,
+        in_channels=input_channels,
+        out_channels=output_channels,
+        batch_size=1,
+        input_height=input_height,
+        input_width=input_width,
+        kernel_size=kernel_size,
+        stride=stride,
+        conv_config=conv_config,
+        return_output_dim=True,
+    )
+    output = ttnn.to_torch(output_tt).reshape(1, output_height, output_width, output_channels).permute(0, 3, 1, 2)
+    passing, message = check_with_pcc_without_tensor_printout(output, golden, pcc=0.999)
+    assert passing, message

@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+import torch
 from tests.ttnn.nightly.unit_tests.operations.conv.test_conv2d import run_conv, torch_tensor_map, HS, WS, BS
+from tests.ttnn.utils_for_testing import check_with_pcc_without_tensor_printout
 import ttnn
 
 
@@ -42,6 +44,57 @@ def test_conv2d_1x1_preserves_pre_sharded_width_input(device, torch_tensor_map, 
         sharded_cfg=input_memory_config,
         expected_memory_layout=ttnn.TensorMemoryLayout.WIDTH_SHARDED,
     )
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 16384}], indirect=True)
+def test_conv2d_1x1_reshards_row_major_height_input_with_tile_padding(device):
+    torch.manual_seed(0)
+    batch_size = 3
+    input_channels = 16
+    output_channels = 32
+    torch_input = torch.randn(batch_size, input_channels, 1, 1, dtype=torch.bfloat16).float()
+    torch_weight = torch.randn(output_channels, input_channels, 1, 1, dtype=torch.bfloat16).float()
+    golden = torch.nn.functional.conv2d(torch_input, torch_weight)
+
+    input_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 0))})
+    input_memory_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(input_grid, (1, input_channels), ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    input_tt = ttnn.from_torch(
+        torch_input.permute(0, 2, 3, 1).reshape(1, 1, batch_size, input_channels),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=device,
+        memory_config=input_memory_config,
+    )
+    weight_tt = ttnn.from_torch(torch_weight, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+    conv_config = ttnn.Conv2dConfig(
+        weights_dtype=ttnn.bfloat16,
+        shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+    )
+
+    output_tt, [output_height, output_width] = ttnn.conv2d(
+        input_tensor=input_tt,
+        weight_tensor=weight_tt,
+        in_channels=input_channels,
+        out_channels=output_channels,
+        device=device,
+        batch_size=batch_size,
+        input_height=1,
+        input_width=1,
+        kernel_size=(1, 1),
+        conv_config=conv_config,
+        dtype=ttnn.bfloat16,
+        return_output_dim=True,
+    )
+
+    assert tuple(output_tt.shape) == (1, 1, batch_size, output_channels)
+    output = ttnn.to_torch(output_tt).reshape(batch_size, output_height, output_width, output_channels)
+    output = output.permute(0, 3, 1, 2)
+    passing, message = check_with_pcc_without_tensor_printout(output, golden, pcc=0.999)
+    assert passing, message
 
 
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 16384}], indirect=True)

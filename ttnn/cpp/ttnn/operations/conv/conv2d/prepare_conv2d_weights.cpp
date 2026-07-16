@@ -8,6 +8,7 @@
 #include "ttnn/operations/conv/conv2d/device/conv2d_device_operation_types.hpp"
 #include "ttnn/operations/conv/conv2d/device/conv2d_device_operation.hpp"
 #include <tt_stl/assert.hpp>
+#include <algorithm>
 #include <cstdint>
 #include <tt-logger/tt-logger.hpp>
 #include "tt-metalium/buffer_types.hpp"
@@ -957,12 +958,22 @@ Tensor convert_conv_weight_tensor_to_depthwise_layout(
         output_conv_weight_tensor_shape);
 }
 
-static Tensor to_folded_weight_layout(const Tensor& conv_weight_tensor, std::array<uint32_t, 2> stride) {
+static Tensor to_folded_weight_layout(
+    const Tensor& conv_weight_tensor,
+    std::array<uint32_t, 2> stride,
+    std::optional<uint32_t> input_channels_padded_before_folding) {
     auto w_shape = conv_weight_tensor.padded_shape();
     uint32_t out_channels = w_shape[0];
     uint32_t in_channels = w_shape[1];
+    uint32_t folded_channel_group_width = input_channels_padded_before_folding.value_or(in_channels);
     uint32_t kernel_h = w_shape[2];
     uint32_t kernel_w = w_shape[3];
+
+    TT_FATAL(
+        folded_channel_group_width >= in_channels,
+        "Folded convolution channel-group width {} cannot be smaller than the weight input channels {}",
+        folded_channel_group_width,
+        in_channels);
 
     // Get input data type
     auto dtype = conv_weight_tensor.dtype();
@@ -974,7 +985,10 @@ static Tensor to_folded_weight_layout(const Tensor& conv_weight_tensor, std::arr
     auto padded_kernel_w = kernel_w + pad_w;
 
     ttnn::Shape output_shape = ttnn::Shape(
-        {out_channels, in_channels * stride[0] * stride[1], padded_kernel_h / stride[0], padded_kernel_w / stride[1]});
+        {out_channels,
+         folded_channel_group_width * stride[0] * stride[1],
+         padded_kernel_h / stride[0],
+         padded_kernel_w / stride[1]});
 
     auto fold_weights = [&]<typename T>(const tt::tt_metal::HostStorage& storage) {
         auto folded_buffer = storage.buffer().transform(
@@ -1009,11 +1023,12 @@ static Tensor to_folded_weight_layout(const Tensor& conv_weight_tensor, std::arr
                                         int x = kw / stride[1];
 
                                         // Calculate folded input channel index
-                                        int folded_ic_idx = ((sh * stride[1] + sw) * in_channels) + ic;
+                                        int folded_ic_idx = ((sh * stride[1] + sw) * folded_channel_group_width) + ic;
 
                                         // Calculate final destination index
-                                        int dst_idx = (oc * in_channels * stride[0] * stride[1] * new_h * new_w) +
-                                                      (folded_ic_idx * new_h * new_w) + (y * new_w) + x;
+                                        int dst_idx =
+                                            (oc * folded_channel_group_width * stride[0] * stride[1] * new_h * new_w) +
+                                            (folded_ic_idx * new_h * new_w) + (y * new_w) + x;
 
                                         output_buffer[dst_idx] = input_buffer[src_idx];
                                     }
@@ -1250,7 +1265,8 @@ static Conv2dWeightsBiasPrepConfig setup_conv_prep_config(
     const std::optional<const DataType>& output_dtype,
     const std::optional<const Conv2dSliceConfig>& dram_slice_config_,
     bool allow_matmul,
-    bool use_depthwise_weight_plan_shape) {
+    bool use_depthwise_weight_plan_shape,
+    std::optional<std::array<uint32_t, 2>> input_tensor_hw) {
     DataType conv_output_dtype = output_dtype.value_or(input_dtype);
 
     std::array<uint32_t, 4> padding_n4 = sliding_window::get_pair_n4_padding(padding);
@@ -1264,6 +1280,9 @@ static Conv2dWeightsBiasPrepConfig setup_conv_prep_config(
                             conv_config,
                             input_memory_config.is_sharded() ? std::make_optional(input_memory_config) : std::nullopt);
     auto orig_stride = stride;
+    const std::optional<uint32_t> input_channels_padded_before_folding =
+        input_memory_config.is_sharded() ? std::make_optional(input_memory_config.shard_spec()->shape[1])
+                                         : std::nullopt;
     const bool is_conv1d = is_1d_conv(kernel_size[0], input_height);
     conv_config.enable_kernel_stride_folding = auto_enable_kernel_folding(
         input_memory_config,
@@ -1372,45 +1391,47 @@ static Conv2dWeightsBiasPrepConfig setup_conv_prep_config(
             "Auto determined DRAM Slice Config in Prepare Conv2d Weights as {} for {}",
             dram_slice_config,
             conv2d_slice_attr->name());
+        const uint32_t full_output_height = output_height;
+        const uint32_t full_output_width = output_width;
+        const uint32_t output_sliced_dim = dram_slice_config.slice_type == Conv2dSliceConfig::SliceType::DRAM_HEIGHT
+                                               ? full_output_height
+                                               : full_output_width;
+        op_slicing::validate_slice_config(output_sliced_dim, conv_config.output_layout, dram_slice_config);
+
         if (dram_slice_config.num_slices == 1) {
             log_debug(tt::LogOp, "DRAM Slicing is not needed as only one slice is required.");
             is_dram_conv = false;
-        }
-        uint32_t slice_rounding_value = 1;
-        if (conv_config.output_layout == tt_metal::Layout::TILE &&
-            dram_slice_config.slice_type == Conv2dSliceConfig::SliceType::DRAM_WIDTH) {
-            // In Conv2d DRAM with Outputs in Tile layout, we need to round the slice size to a multiple of TILE_HEIGHT.
-            slice_rounding_value = tt::constants::TILE_HEIGHT;
-        }
-
-        const uint32_t output_sliced_dim =
-            dram_slice_config.slice_type == Conv2dSliceConfig::SliceType::DRAM_HEIGHT ? output_height : output_width;
-
-        TT_FATAL(
-            dram_slice_config.num_slices <= output_sliced_dim,
-            " Number of slices {} should be less or equal than the dimension being sliced {} in Conv2D DRAM Slicing",
-            dram_slice_config.num_slices,
-            output_sliced_dim);
-
-        const uint32_t min_output_slice_size =
-            tt::div_up(tt::div_up(output_sliced_dim, slice_rounding_value), dram_slice_config.num_slices) *
-            slice_rounding_value;
-
-        if (dram_slice_config.slice_type == Conv2dSliceConfig::SliceType::DRAM_HEIGHT) {
-            output_height = min_output_slice_size;
-            input_height = ((output_height - 1) * stride[0]) + ((kernel_size[0] - 1) * (dilation[0] - 1)) +
-                           kernel_size[0] - padding_n4[0];
-            padding_n4[1] = 0;  // No padding on bottom for sliced height
         } else {
-            output_width = min_output_slice_size;
-            input_width = ((output_width - 1) * stride[1]) + ((kernel_size[1] - 1) * (dilation[1] - 1)) +
-                          kernel_size[1] - padding_n4[2];
-            padding_n4[3] = 0;  // No padding on right for sliced width
+            const auto first_output_slice =
+                op_slicing::get_output_slice_range(output_sliced_dim, conv_config.output_layout, dram_slice_config, 0);
+            std::array<uint32_t, 2> output_slice_start = {0, 0};
+            std::array<uint32_t, 2> output_slice_end = {full_output_height, full_output_width};
+            if (dram_slice_config.slice_type == Conv2dSliceConfig::SliceType::DRAM_HEIGHT) {
+                output_slice_start[0] = first_output_slice.start;
+                output_slice_end[0] = first_output_slice.end;
+            } else {
+                output_slice_start[1] = first_output_slice.start;
+                output_slice_end[1] = first_output_slice.end;
+            }
+
+            const auto slice_plan = determine_conv2d_slice_plan(
+                {input_height, input_width},
+                output_slice_start,
+                output_slice_end,
+                kernel_size,
+                stride,
+                padding_n4,
+                dilation,
+                conv_config.output_layout);
+            input_height = slice_plan.input_end[0] - slice_plan.input_start[0];
+            input_width = slice_plan.input_end[1] - slice_plan.input_start[1];
+            padding_n4 = slice_plan.padding;
+            output_height = slice_plan.output_shape[0];
+            output_width = slice_plan.output_shape[1];
+            input_memory_config = conv2d_slice_attr->get_input_memory_config(
+                {output_slice_start[0], output_slice_start[1]}, {output_slice_end[0], output_slice_end[1]});
+            input_layout = Layout::ROW_MAJOR;
         }
-        input_memory_config = conv2d_slice_attr->get_input_memory_config(
-            {0, 0},                        // Slice Start
-            {output_height, output_width}  // Slice End
-        );
     }
 
     const bool auto_shard = !input_memory_config.is_sharded() && !conv_config.shard_layout.has_value();
@@ -1441,8 +1462,10 @@ static Conv2dWeightsBiasPrepConfig setup_conv_prep_config(
 
     const bool conv_is_1d_depthwise =
         is_1d_depthwise_conv(groups, in_channels, out_channels, kernel_size[0], input_height, has_bias);
+    const auto [input_tensor_height, input_tensor_width] =
+        input_tensor_hw.value_or(std::array<uint32_t, 2>{input_height, input_width});
     const auto input_tensor_spec = tt::tt_metal::TensorSpec(
-        Shape({batch_size, input_height, input_width, in_channels}),
+        Shape({1, 1, batch_size * input_tensor_height * input_tensor_width, in_channels}),
         tt::tt_metal::TensorLayout(input_dtype, tt::tt_metal::PageConfig(input_layout), input_memory_config));
     const auto input_plan = determine_conv_input_parallel_config(
         device->compute_with_storage_grid_size(),
@@ -1520,7 +1543,8 @@ static Conv2dWeightsBiasPrepConfig setup_conv_prep_config(
         conv_config.enable_activation_reuse,
         coalesce_1d_depthwise_kw_reads,
         use_depthwise_weight_plan_shape,
-        orig_stride);
+        orig_stride,
+        conv_config.enable_kernel_stride_folding.value() ? input_channels_padded_before_folding : std::nullopt);
 }
 
 static ttnn::Tensor prepare_conv_weights_internal(
@@ -1569,7 +1593,8 @@ static ttnn::Tensor prepare_conv_weights_internal(
         }
     }
     if (params.enable_kernel_stride_folding) {
-        weight_tensor_ = to_folded_weight_layout(weight_tensor_, params.stride);
+        weight_tensor_ =
+            to_folded_weight_layout(weight_tensor_, params.stride, params.input_channels_padded_before_folding);
     }
     const auto& weights_shape = weight_tensor_.logical_shape();
     uint32_t out_channels = weights_shape[0];
@@ -1732,7 +1757,8 @@ ttnn::Tensor detail::prepare_conv_weights(
     const std::optional<const DeviceComputeKernelConfig>& compute_config_,
     const std::optional<const Conv2dSliceConfig>& dram_slice_config_,
     bool allow_matmul,
-    bool use_depthwise_weight_plan_shape) {
+    bool use_depthwise_weight_plan_shape,
+    std::optional<std::array<uint32_t, 2>> input_tensor_hw) {
     if (weights_format != "OIHW") {
         log_warning(
             tt::LogOp,
@@ -1776,7 +1802,8 @@ ttnn::Tensor detail::prepare_conv_weights(
         output_dtype,
         dram_slice_config_,
         allow_matmul,
-        use_depthwise_weight_plan_shape);
+        use_depthwise_weight_plan_shape,
+        input_tensor_hw);
 
     // Use internal API to prepare weights
     return prepare_conv_weights_internal(weight_tensor, params, device);
@@ -1830,6 +1857,14 @@ ttnn::Tensor prepare_conv_weights(
         true);
 }
 
+DataType detail::get_conv_bias_weight_dtype(const Conv2dConfig& conv_config) {
+    TT_FATAL(
+        conv_config.weights_dtype.has_value(),
+        "prepare_conv_bias requires conv_config.weights_dtype to be set because the bias tensor alone does not "
+        "identify the prepared weights dtype");
+    return conv_config.weights_dtype.value();
+}
+
 ttnn::Tensor detail::prepare_conv_bias(
     const ttnn::Tensor& bias_tensor,
     const ttnn::MemoryConfig& input_memory_config,
@@ -1850,14 +1885,14 @@ ttnn::Tensor detail::prepare_conv_bias(
     const std::optional<const Conv2dConfig>& conv_config_,
     const std::optional<const DeviceComputeKernelConfig>& compute_config_,
     const std::optional<const Conv2dSliceConfig>& dram_slice_config_,
-    bool allow_matmul) {
+    bool allow_matmul,
+    std::optional<std::array<uint32_t, 2>> input_tensor_hw) {
     TT_FATAL(!ttnn::has_storage_type_of(bias_tensor, ttnn::DEVICE_STORAGE_TYPE), "conv bias should be placed on host");
     Conv2dConfig conv_config = conv_config_.value_or(Conv2dConfig());
 
-    TT_ASSERT(conv_config.weights_dtype.has_value(), "prepare_conv_bias requires conv_config.weights_dtype to be set.");
-
-    DeviceComputeKernelConfig compute_config = compute_config_.value_or(
-        get_conv_default_compute_kernel_config(device, input_dtype, conv_config.weights_dtype.value()));
+    const DataType weight_dtype = get_conv_bias_weight_dtype(conv_config);
+    DeviceComputeKernelConfig compute_config =
+        compute_config_.value_or(get_conv_default_compute_kernel_config(device, input_dtype, weight_dtype));
 
     // Use common setup function to get configuration parameters
     auto params = setup_conv_prep_config(
@@ -1881,15 +1916,12 @@ ttnn::Tensor detail::prepare_conv_bias(
         output_dtype,
         dram_slice_config_,
         allow_matmul,
-        true);
+        true,
+        input_tensor_hw);
 
     // Use internal API to prepare bias
     auto prepared_bias = prepare_conv_bias_internal(
-        std::optional<const ttnn::Tensor>(bias_tensor),
-        out_channels,
-        params,
-        conv_config.weights_dtype.value(),
-        device);
+        std::optional<const ttnn::Tensor>(bias_tensor), out_channels, params, weight_dtype, device);
 
     return prepared_bias.value();  // We know bias exists since we passed it
 }

@@ -411,12 +411,19 @@ FoldedTensorLayout determine_folded_tensor_layout(
 
     MemoryConfig processed_memory_config = input_memory_config;
     Shape processed_shape = input_shape;
+    const auto& input_shard_spec = input_memory_config.shard_spec().value();
+    if (input_shape[-1] != input_shard_spec.shape[1]) {
+        processed_shape = Shape({input_shape[0], input_shape[1], input_shape[2], input_shard_spec.shape[1]});
+        processed_memory_config =
+            create_sharded_memory_config(processed_shape, input_shard_spec.grid, ShardOrientation::ROW_MAJOR);
+    }
+
     const bool has_hw_padding = (padding[0] | padding[1] | padding[2] | padding[3]) != 0;
     if (has_hw_padding) {
-        const auto& shard_spec = input_memory_config.shard_spec().value();
+        const auto& shard_spec = processed_memory_config.shard_spec().value();
         sliding_window::SlidingWindowConfig sliding_window_config{
-            .batch_size = input_shape[0],
-            .input_hw = {input_shape[1], input_shape[2]},
+            .batch_size = processed_shape[0],
+            .input_hw = {processed_shape[1], processed_shape[2]},
             .window_hw = {1, 1},
             .stride_hw = {1, 1},
             .padding = padding,
@@ -435,10 +442,10 @@ FoldedTensorLayout determine_folded_tensor_layout(
         processed_memory_config =
             MemoryConfig(input_memory_config.memory_layout(), input_memory_config.buffer_type(), padded_shard_spec);
         processed_shape = Shape(
-            {input_shape[0],
-             input_shape[1] + padding[0] + padding[1],
-             input_shape[2] + padding[2] + padding[3],
-             input_shape[3]});
+            {processed_shape[0],
+             processed_shape[1] + padding[0] + padding[1],
+             processed_shape[2] + padding[2] + padding[3],
+             processed_shape[3]});
     }
 
     processed_memory_config =

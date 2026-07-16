@@ -1386,7 +1386,7 @@ def test_conv1d_depthwise_rejects_pre_sharded_width_input_with_height_config(dev
 def test_conv1d_depthwise_reshards_padded_block_input_to_height(device):
     channels = 96
     input_length = 32
-    input_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 0))})
+    input_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(3, 0))})
     input_memory_config = ttnn.MemoryConfig(
         ttnn.TensorMemoryLayout.BLOCK_SHARDED,
         ttnn.BufferType.L1,
@@ -1438,7 +1438,6 @@ def test_conv1d_depthwise_preserves_padded_block_width_and_trims_inactive_cores(
         shard_layout=ttnn.TensorMemoryLayout.BLOCK_SHARDED,
         input_in_dram=False,
         input_memory_config=input_memory_config,
-        input_padded_shape=(1, input_length, 192),
         expected_memory_layout=ttnn.TensorMemoryLayout.BLOCK_SHARDED,
         expected_shard_width=96,
         expected_num_cores=2,

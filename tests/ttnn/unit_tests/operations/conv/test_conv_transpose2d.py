@@ -119,34 +119,257 @@ def test_conv_transpose2d_1x1_dram_input_uses_matmul_parameter_layout(device, pr
 
 
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 64 * 1024}], indirect=True)
-@pytest.mark.parametrize("preprocess_weights", [False, True])
-def test_conv_transpose2d_1d_depthwise_prepared_weights_match_runtime(device, preprocess_weights):
-    run_conv_transpose2d(
-        device=device,
-        math_fidelity=ttnn.MathFidelity.HiFi4,
-        activations_dtype=ttnn.bfloat16,
-        weights_dtype=ttnn.bfloat16,
-        batch_size=1,
-        output_channels=1,
-        input_channels=1,
-        input_height=1,
-        input_width=8,
-        filter_height=1,
-        filter_width=3,
-        stride_h=1,
-        stride_w=1,
-        pad_h=0,
-        pad_w=1,
-        out_pad_h=0,
-        out_pad_w=0,
+def test_conv_transpose2d_1d_depthwise_weight_preparation_matches_runtime(device):
+    torch.manual_seed(0)
+    input_channels = 1
+    output_channels = 1
+    input_height = 1
+    input_width = 8
+    kernel_size = (1, 3)
+    stride = (1, 1)
+    padding = (0, 1)
+
+    input_tt = ttnn.from_torch(
+        torch.randn(1, input_height, input_width, input_channels, dtype=torch.bfloat16).float(),
+        dtype=ttnn.bfloat16,
         layout=ttnn.ROW_MAJOR_LAYOUT,
-        groups=1,
-        has_bias=False,
-        auto_shard=True,
-        preprocess_weights_bias=preprocess_weights,
-        input_memory_config=ttnn.L1_MEMORY_CONFIG,
-        fast_compare=False,
+        device=device,
+        memory_config=ttnn.L1_MEMORY_CONFIG,
     )
+    torch_weight = torch.randn(input_channels, output_channels, *kernel_size, dtype=torch.bfloat16).float()
+    weight_tt = ttnn.from_torch(torch_weight, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+    conv_config = ttnn.Conv2dConfig(weights_dtype=ttnn.bfloat16)
+
+    _, _, [runtime_weight, runtime_bias] = ttnn.conv_transpose2d(
+        input_tensor=input_tt,
+        weight_tensor=weight_tt,
+        in_channels=input_channels,
+        out_channels=output_channels,
+        device=device,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        output_padding=(0, 0),
+        dilation=(1, 1),
+        batch_size=1,
+        input_height=input_height,
+        input_width=input_width,
+        groups=1,
+        conv_config=conv_config,
+        return_output_dim=True,
+        return_weights_and_bias=True,
+    )
+    prepared_weight = ttnn.prepare_conv_transpose2d_weights(
+        weight_tensor=weight_tt,
+        input_memory_config=ttnn.L1_MEMORY_CONFIG,
+        input_layout=ttnn.ROW_MAJOR_LAYOUT,
+        weights_format="IOHW",
+        in_channels=input_channels,
+        out_channels=output_channels,
+        batch_size=1,
+        input_height=input_height,
+        input_width=input_width,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        dilation=(1, 1),
+        has_bias=False,
+        groups=1,
+        device=device,
+        input_dtype=ttnn.bfloat16,
+        conv_config=conv_config,
+    )
+
+    assert runtime_bias is None
+    assert tuple(runtime_weight.shape) == (1, 1, input_channels * kernel_size[0] * kernel_size[1], output_channels)
+    assert runtime_weight.shape == prepared_weight.shape
+    assert runtime_weight.padded_shape == prepared_weight.padded_shape
+    assert runtime_weight.layout == prepared_weight.layout
+    assert runtime_weight.dtype == prepared_weight.dtype
+    assert runtime_weight.memory_config() == prepared_weight.memory_config()
+    assert torch.equal(ttnn.to_torch(runtime_weight.cpu()), ttnn.to_torch(prepared_weight.cpu()))
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 64 * 1024}], indirect=True)
+def test_conv_transpose2d_dram_prepared_parameters_match_first_runtime_slice(device):
+    torch.manual_seed(0)
+    batch_size = 1
+    input_height = 32
+    input_width = 32
+    input_channels = 64
+    output_channels = 64
+    kernel_size = (8, 8)
+    stride = (4, 4)
+    padding = (2, 2)
+    output_padding = (2, 2)
+
+    torch_input = torch.randn(
+        batch_size, input_channels, input_height, input_width, dtype=torch.bfloat16
+    ).float()
+    torch_weight = torch.randn(input_channels, output_channels, *kernel_size, dtype=torch.bfloat16).float()
+    torch_bias = torch.randn(1, 1, 1, output_channels, dtype=torch.bfloat16).float()
+    input_tt = ttnn.from_torch(
+        torch_input.permute(0, 2, 3, 1),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=device,
+    )
+    conv_config = ttnn.Conv2dConfig(
+        weights_dtype=ttnn.bfloat16,
+        shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        output_layout=ttnn.ROW_MAJOR_LAYOUT,
+    )
+    slice_config = ttnn.Conv2dSliceConfig(slice_type=ttnn.Conv2dDRAMSliceWidth, num_slices=2)
+    op_args = dict(
+        input_tensor=input_tt,
+        in_channels=input_channels,
+        out_channels=output_channels,
+        device=device,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        output_padding=output_padding,
+        dilation=(1, 1),
+        batch_size=batch_size,
+        input_height=input_height,
+        input_width=input_width,
+        groups=1,
+        conv_config=conv_config,
+        dram_slice_config=slice_config,
+    )
+
+    runtime_output, _, [runtime_weight, runtime_bias] = ttnn.conv_transpose2d(
+        weight_tensor=ttnn.from_torch(torch_weight, dtype=ttnn.bfloat16),
+        bias_tensor=ttnn.from_torch(torch_bias, dtype=ttnn.bfloat16),
+        return_output_dim=True,
+        return_weights_and_bias=True,
+        **op_args,
+    )
+    prepared_weight = ttnn.prepare_conv_transpose2d_weights(
+        weight_tensor=ttnn.from_torch(torch_weight, dtype=ttnn.bfloat16),
+        input_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        input_layout=ttnn.ROW_MAJOR_LAYOUT,
+        weights_format="IOHW",
+        in_channels=input_channels,
+        out_channels=output_channels,
+        batch_size=batch_size,
+        input_height=input_height,
+        input_width=input_width,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        output_padding=output_padding,
+        dilation=(1, 1),
+        has_bias=True,
+        groups=1,
+        device=device,
+        input_dtype=ttnn.bfloat16,
+        conv_config=conv_config,
+        dram_slice_config=slice_config,
+    )
+    prepared_bias = ttnn.prepare_conv_transpose2d_bias(
+        bias_tensor=ttnn.from_torch(torch_bias, dtype=ttnn.bfloat16),
+        input_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        input_layout=ttnn.ROW_MAJOR_LAYOUT,
+        in_channels=input_channels,
+        out_channels=output_channels,
+        batch_size=batch_size,
+        input_height=input_height,
+        input_width=input_width,
+        kernel_size=kernel_size,
+        stride=stride,
+        padding=padding,
+        output_padding=output_padding,
+        dilation=(1, 1),
+        groups=1,
+        device=device,
+        input_dtype=ttnn.bfloat16,
+        conv_config=conv_config,
+        dram_slice_config=slice_config,
+    )
+    prepared_output, _ = ttnn.conv_transpose2d(
+        weight_tensor=prepared_weight,
+        bias_tensor=prepared_bias,
+        return_output_dim=True,
+        **op_args,
+    )
+
+    assert runtime_weight.shape == prepared_weight.shape
+    assert runtime_weight.padded_shape == prepared_weight.padded_shape
+    assert runtime_weight.memory_config() == prepared_weight.memory_config()
+    assert torch.equal(ttnn.to_torch(runtime_weight.cpu()), ttnn.to_torch(prepared_weight.cpu()))
+    assert runtime_bias.shape == prepared_bias.shape
+    assert runtime_bias.padded_shape == prepared_bias.padded_shape
+    assert runtime_bias.memory_config() == prepared_bias.memory_config()
+    assert torch.equal(ttnn.to_torch(runtime_bias.cpu()), ttnn.to_torch(prepared_bias.cpu()))
+    assert torch.equal(ttnn.to_torch(runtime_output.cpu()), ttnn.to_torch(prepared_output.cpu()))
+
+
+@pytest.mark.parametrize("device_params", [{"l1_small_size": 64 * 1024}], indirect=True)
+def test_conv_transpose2d_dram_tile_width_slice_count_uses_tile_units(device):
+    batch_size = 1
+    input_height = 8
+    input_width = 33
+    input_channels = 32
+    output_channels = 32
+    kernel_size = (3, 3)
+    slice_config = ttnn.Conv2dSliceConfig(slice_type=ttnn.Conv2dDRAMSliceWidth, num_slices=3)
+    conv_config = ttnn.Conv2dConfig(
+        weights_dtype=ttnn.bfloat16,
+        shard_layout=ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        output_layout=ttnn.TILE_LAYOUT,
+    )
+    torch_weight = torch.randn(input_channels, output_channels, *kernel_size, dtype=torch.bfloat16).float()
+    input_tt = ttnn.from_torch(
+        torch.randn(batch_size, input_height, input_width, input_channels, dtype=torch.bfloat16).float(),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=device,
+    )
+
+    with pytest.raises(RuntimeError):
+        ttnn.prepare_conv_transpose2d_weights(
+            weight_tensor=ttnn.from_torch(torch_weight, dtype=ttnn.bfloat16),
+            input_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            input_layout=ttnn.ROW_MAJOR_LAYOUT,
+            weights_format="IOHW",
+            in_channels=input_channels,
+            out_channels=output_channels,
+            batch_size=batch_size,
+            input_height=input_height,
+            input_width=input_width,
+            kernel_size=kernel_size,
+            stride=(1, 1),
+            padding=(1, 1),
+            output_padding=(0, 0),
+            dilation=(1, 1),
+            has_bias=False,
+            groups=1,
+            device=device,
+            input_dtype=ttnn.bfloat16,
+            conv_config=conv_config,
+            dram_slice_config=slice_config,
+        )
+
+    with pytest.raises(RuntimeError):
+        ttnn.conv_transpose2d(
+            input_tensor=input_tt,
+            weight_tensor=ttnn.from_torch(torch_weight, dtype=ttnn.bfloat16),
+            in_channels=input_channels,
+            out_channels=output_channels,
+            device=device,
+            kernel_size=kernel_size,
+            stride=(1, 1),
+            padding=(1, 1),
+            output_padding=(0, 0),
+            dilation=(1, 1),
+            batch_size=batch_size,
+            input_height=input_height,
+            input_width=input_width,
+            groups=1,
+            conv_config=conv_config,
+            dram_slice_config=slice_config,
+        )
 
 
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 64 * 1024}], indirect=True)
@@ -400,7 +623,13 @@ def test_simple_conv_t2d_weights_bias_match(
     tt_bias_tensor = ttnn.from_torch(
         torch_bias_tensor, weights_dtype if weights_dtype != ttnn.bfloat8_b else ttnn.float32
     )
-    tt_input_tensor = ttnn.from_torch(torch_input_tensor, ttnn.bfloat16, device=device)
+    input_layout = ttnn.TILE_LAYOUT if activations_dtype == ttnn.bfloat8_b else ttnn.ROW_MAJOR_LAYOUT
+    tt_input_tensor = ttnn.from_torch(
+        torch_input_tensor,
+        dtype=activations_dtype,
+        layout=input_layout,
+        device=device,
+    )
 
     # Setup configs
     conv_config = ttnn.Conv2dConfig(
@@ -465,7 +694,7 @@ def test_simple_conv_t2d_weights_bias_match(
     weights_from_prepare = ttnn.prepare_conv_transpose2d_weights(
         weight_tensor=tt_weight_tensor_host,
         input_memory_config=ttnn.L1_MEMORY_CONFIG,
-        input_layout=ttnn.ROW_MAJOR_LAYOUT,
+        input_layout=input_layout,
         weights_format="IOHW",
         in_channels=input_channels,
         out_channels=output_channels,
@@ -475,6 +704,7 @@ def test_simple_conv_t2d_weights_bias_match(
         kernel_size=(filter_height, filter_width),
         stride=(stride_h, stride_w),
         padding=(pad_h, pad_w),
+        output_padding=(out_pad_h, out_pad_w),
         dilation=(dilation, dilation),
         has_bias=True,
         groups=1,
@@ -488,7 +718,7 @@ def test_simple_conv_t2d_weights_bias_match(
     bias_from_prepare = ttnn.prepare_conv_transpose2d_bias(
         bias_tensor=tt_bias_tensor_host,
         input_memory_config=ttnn.L1_MEMORY_CONFIG,
-        input_layout=ttnn.ROW_MAJOR_LAYOUT,
+        input_layout=input_layout,
         in_channels=input_channels,
         out_channels=output_channels,
         batch_size=batch_size,
@@ -498,6 +728,7 @@ def test_simple_conv_t2d_weights_bias_match(
         kernel_size=(filter_height, filter_width),
         stride=(stride_h, stride_w),
         padding=(pad_h, pad_w),
+        output_padding=(out_pad_h, out_pad_w),
         dilation=(dilation, dilation),
         groups=1,
         conv_config=conv_config,

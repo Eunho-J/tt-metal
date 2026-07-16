@@ -22,6 +22,7 @@
 #include "ttnn/operations/data_movement/untilize/untilize.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
 #include "ttnn/operations/functions.hpp"
+#include "ttnn/operations/sliding_window/op_slicing/op_slicing.hpp"
 #include "ttnn/types.hpp"
 #include "ttnn_test_fixtures.hpp"
 #include "ttnn/operations/core/core.hpp"
@@ -42,6 +43,49 @@ struct Conv2DParam {
 
 class Conv2DFixture : public ::testing::Test, public testing::WithParamInterface<Conv2DParam> {};
 
+TEST(Conv2DSlicePlannerTest, TileHeightSliceUsesEffectiveRoundedWidth) {
+    const auto slice_config =
+        op_slicing::Op2DSliceConfig{.slice_type = op_slicing::Op2DSliceConfig::SliceType::DRAM_HEIGHT, .num_slices = 2};
+    const auto output_range = op_slicing::get_output_slice_range(64, Layout::TILE, slice_config, 0);
+    ASSERT_EQ(output_range.start, 0);
+    ASSERT_EQ(output_range.end, 32);
+
+    const auto plan = determine_conv2d_slice_plan(
+        {64, 50}, {output_range.start, 0}, {output_range.end, 50}, {3, 3}, {1, 1}, {1, 1, 1, 1}, {1, 1}, Layout::TILE);
+
+    EXPECT_EQ(plan.input_start, (std::array<uint32_t, 2>{0, 0}));
+    EXPECT_EQ(plan.input_end, (std::array<uint32_t, 2>{33, 50}));
+    EXPECT_EQ(plan.padding, (std::array<uint32_t, 4>{1, 0, 1, 15}));
+    EXPECT_EQ(plan.output_shape, (std::array<uint32_t, 2>{32, 64}));
+}
+
+TEST(Conv2DSlicePlannerTest, PreservesPaddingRequiredBeforeTheFinalSlice) {
+    const auto plan =
+        determine_conv2d_slice_plan({4, 32}, {0, 0}, {3, 32}, {3, 3}, {1, 1}, {0, 3, 1, 1}, {1, 1}, Layout::ROW_MAJOR);
+
+    EXPECT_EQ(plan.input_start, (std::array<uint32_t, 2>{0, 0}));
+    EXPECT_EQ(plan.input_end, (std::array<uint32_t, 2>{4, 32}));
+    EXPECT_EQ(plan.padding, (std::array<uint32_t, 4>{0, 1, 1, 1}));
+    EXPECT_EQ(plan.output_shape, (std::array<uint32_t, 2>{3, 32}));
+}
+
+TEST(Conv2DSlicePlannerTest, TileWidthSliceCountUsesTileUnits) {
+    EXPECT_EQ(op_slicing::get_max_num_slices(64, Layout::TILE, op_slicing::Op2DSliceConfig::SliceType::DRAM_WIDTH), 2);
+    EXPECT_THROW(
+        op_slicing::validate_slice_config(
+            64,
+            Layout::TILE,
+            op_slicing::Op2DSliceConfig{
+                .slice_type = op_slicing::Op2DSliceConfig::SliceType::DRAM_WIDTH, .num_slices = 3}),
+        std::runtime_error);
+
+    const auto slice_config =
+        op_slicing::Op2DSliceConfig{.slice_type = op_slicing::Op2DSliceConfig::SliceType::DRAM_WIDTH, .num_slices = 3};
+    EXPECT_EQ(op_slicing::get_output_slice_range(65, Layout::TILE, slice_config, 0).end, 32);
+    EXPECT_EQ(op_slicing::get_output_slice_range(65, Layout::TILE, slice_config, 1).end, 64);
+    EXPECT_EQ(op_slicing::get_output_slice_range(65, Layout::TILE, slice_config, 2).end, 65);
+}
+
 TEST(Conv2DFoldPlannerTest, PreservesPhysicalChannelsInHeightShardedFold) {
     const auto input_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{0, 0}}};
     const auto input_memory_config = MemoryConfig{
@@ -61,6 +105,22 @@ TEST(Conv2DFoldPlannerTest, PreservesPhysicalChannelsInHeightShardedFold) {
     const auto folded_spec = TensorSpec(
         Shape({1, 4, 4, 12}), TensorLayout(DataType::BFLOAT16, Layout::ROW_MAJOR, folded_layout.memory_config));
     EXPECT_EQ(folded_spec.padded_shape()[-1], 32);
+}
+
+TEST(Conv2DFoldPlannerTest, MatchesChannelPadReshardForOverprovisionedHeightShard) {
+    const auto input_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{1, 0}}};
+    const auto input_memory_config = MemoryConfig{
+        TensorMemoryLayout::HEIGHT_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{input_grid, {64, 8}, ShardOrientation::ROW_MAJOR}};
+
+    const auto folded_layout = data_movement::determine_folded_tensor_layout(
+        Shape({1, 8, 8, 3}), input_memory_config, 2, 2, {0, 0, 0, 0}, CoreCoord{13, 10});
+
+    EXPECT_EQ(folded_layout.layout, Layout::ROW_MAJOR);
+    ASSERT_TRUE(folded_layout.memory_config.shard_spec().has_value());
+    EXPECT_EQ(folded_layout.memory_config.shard_spec()->grid, input_grid);
+    EXPECT_EQ(folded_layout.memory_config.shard_spec()->shape, (std::array<uint32_t, 2>{8, 32}));
 }
 
 TEST(Conv2DFoldPlannerTest, MatchesHaloShardHeightForBatchedPadding) {
@@ -187,6 +247,37 @@ TEST(Conv2DInputPlannerTest, ReshardPreservesPhysicalChannelPadding) {
     EXPECT_EQ(input_plan.parallel_config.grid, conv_config.core_grid.value());
 }
 
+TEST(Conv2DInputPlannerTest, HeightReshardPadsChannelsForTileLayout) {
+    const CoreCoord compute_grid{13, 10};
+
+    const auto existing_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{3, 0}}};
+    const auto existing_memory_config = MemoryConfig{
+        TensorMemoryLayout::HEIGHT_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{existing_grid, {1, 16}, ShardOrientation::ROW_MAJOR}};
+    Conv2dConfig conv_config;
+    conv_config.shard_layout = TensorMemoryLayout::HEIGHT_SHARDED;
+
+    const auto input_plan = determine_conv_input_parallel_config(
+        compute_grid,
+        existing_memory_config,
+        conv_config,
+        /*batch_size=*/3,
+        /*output_height=*/1,
+        /*output_width=*/1,
+        /*in_channels=*/16,
+        /*out_channels=*/32,
+        Layout::ROW_MAJOR,
+        /*is_mm_conv=*/true,
+        /*is_1d_depthwise_conv=*/false,
+        /*l1_alignment_bytes=*/64,
+        /*input_tensor_channels_padded=*/16);
+
+    EXPECT_TRUE(input_plan.needs_shard_or_reshard);
+    EXPECT_EQ(input_plan.input_channels_padded, 32);
+    EXPECT_EQ(input_plan.parallel_config.shard_scheme, TensorMemoryLayout::HEIGHT_SHARDED);
+}
+
 TEST(Conv2DInputPlannerTest, DepthwiseBlockReshardPreservesShardWidthAndTrimsInactiveCores) {
     const CoreCoord compute_grid{13, 10};
 
@@ -217,6 +308,39 @@ TEST(Conv2DInputPlannerTest, DepthwiseBlockReshardPreservesShardWidthAndTrimsIna
     EXPECT_EQ(input_plan.input_channels_padded, 128);
     EXPECT_EQ(input_plan.parallel_config.shard_scheme, TensorMemoryLayout::BLOCK_SHARDED);
     EXPECT_EQ(get_num_cores_channels_from_parallel_config(input_plan.parallel_config), 2);
+}
+
+TEST(Conv2DInputPlannerTest, DepthwiseBlockReshardUsesTileAlignedChannelPartition) {
+    const CoreCoord compute_grid{13, 10};
+
+    const auto existing_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{3, 0}}};
+    const auto existing_memory_config = MemoryConfig{
+        TensorMemoryLayout::BLOCK_SHARDED,
+        BufferType::L1,
+        tt::tt_metal::ShardSpec{existing_grid, {10, 16}, ShardOrientation::ROW_MAJOR}};
+    Conv2dConfig conv_config;
+
+    const auto input_plan = determine_conv_input_parallel_config(
+        compute_grid,
+        existing_memory_config,
+        conv_config,
+        /*batch_size=*/1,
+        /*output_height=*/1,
+        /*output_width=*/10,
+        /*in_channels=*/64,
+        /*out_channels=*/64,
+        Layout::ROW_MAJOR,
+        /*is_mm_conv=*/false,
+        /*is_1d_depthwise_conv=*/true,
+        /*l1_alignment_bytes=*/64,
+        /*input_tensor_channels_padded=*/64);
+
+    EXPECT_TRUE(input_plan.needs_shard_or_reshard);
+    EXPECT_EQ(input_plan.input_channels_padded, 64);
+    EXPECT_EQ(input_plan.parallel_config.shard_scheme, TensorMemoryLayout::BLOCK_SHARDED);
+    EXPECT_EQ(get_num_cores_channels_from_parallel_config(input_plan.parallel_config), 2);
+    EXPECT_EQ(
+        input_plan.input_channels_padded / get_num_cores_channels_from_parallel_config(input_plan.parallel_config), 32);
 }
 
 TEST(Conv2DInputPlannerTest, DepthwiseBlockOutputPreservesInputChannelPartitionCapacity) {

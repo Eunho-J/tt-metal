@@ -325,6 +325,8 @@ Result conv2d_L1(
         tt::tt_metal::is_device_tensor(input_tensor_) && input_tensor_.is_sharded()
             ? std::make_optional(input_tensor_.memory_config())
             : std::nullopt;
+    const std::optional<uint32_t> input_channels_padded_before_folding =
+        input_sharded_memory_config.has_value() ? std::make_optional(input_tensor_.padded_shape()[-1]) : std::nullopt;
     bool mm_conv = use_matmul_for_1x1_conv(
         kernel_size, stride, padding_n4, dilation, groups, conv_config, input_sharded_memory_config);
     // Store the original stride size for weight folding
@@ -476,7 +478,8 @@ Result conv2d_L1(
         conv_config.enable_activation_reuse,
         coalesce_1d_depthwise_kw_reads,
         false,
-        orig_stride);
+        orig_stride,
+        conv_config.enable_kernel_stride_folding.value() ? input_channels_padded_before_folding : std::nullopt);
 
     // Prepare weights and move to device if necessary
     if (!is_device_tensor(weight_tensor)) {
@@ -727,6 +730,20 @@ class Conv2dSliceAttr : public ttnn::operations::op_slicing::OpSliceAttr {
     DeviceComputeKernelConfig compute_config;
     MeshDevice* device;
 
+    Conv2dSlicePlan get_slice_plan(const IOShape& output_slice_start, const IOShape& output_slice_end) const {
+        const auto [output_height_start, output_width_start] = output_slice_start;
+        const auto [output_height_end, output_width_end] = output_slice_end;
+        return determine_conv2d_slice_plan(
+            {std::get<0>(input_shape), std::get<1>(input_shape)},
+            {output_height_start, output_width_start},
+            {output_height_end, output_width_end},
+            kernel_size,
+            stride,
+            padding_n4,
+            dilation,
+            conv_config.output_layout);
+    }
+
 public:
     Conv2dSliceAttr(
         uint32_t batch_size,
@@ -766,76 +783,11 @@ public:
 
     std::tuple<std::tuple<IOShape, IOShape>, std::array<uint32_t, 4>> get_input_slice_and_padding(
         const IOShape& output_slice_start, const IOShape& output_slice_end) const {
-        auto [output_slice_height_start, output_slice_width_start] = output_slice_start;
-        auto [output_slice_height_end, output_slice_width_end] = output_slice_end;
-        auto [input_height, input_width] = input_shape;
-
-        // Calculate required input slice range based on output slice
-        // Formula: input_start = (output_start * stride) - padding
-        // Formula: input_end = ((output_end - 1) * stride) - padding + dilated_kernel_size
-        int input_slice_height_start = (output_slice_height_start * stride[0]) - padding_n4[0];
-        int input_slice_height_end = ((output_slice_height_end - 1) * stride[0]) - padding_n4[0] +
-                                     ((kernel_size[0] - 1) * (dilation[0] - 1)) + kernel_size[0];
-        int input_slice_width_start = (output_slice_width_start * stride[1]) - padding_n4[2];
-        int input_slice_width_end = ((output_slice_width_end - 1) * stride[1]) - padding_n4[2] +
-                                    ((kernel_size[1] - 1) * (dilation[1] - 1)) + kernel_size[1];
-
-        // Calculate padding needed if input slice extends beyond input tensor
-        uint32_t pad_top = std::max<int>(0, -input_slice_height_start);
-        uint32_t pad_bottom = std::max<int>(0, input_slice_height_end - input_height);
-        uint32_t pad_left = std::max<int>(0, -input_slice_width_start);
-        uint32_t pad_right = std::max<int>(0, input_slice_width_end - input_width);
-
-        // Clamp input slice to valid input tensor bounds
-        input_slice_height_start = std::max<int>(0, input_slice_height_start);
-        input_slice_height_end = std::min<int>(input_height, input_slice_height_end);
-        input_slice_width_start = std::max<int>(0, input_slice_width_start);
-        input_slice_width_end = std::min<int>(input_width, input_slice_width_end);
-
-        // Calculate full output dimensions
-        auto [output_height, output_width] = calculate_output_image_size(
-            std::array<uint32_t, 2>{input_height, input_width}, kernel_size, stride, padding_n4, dilation);
-
-        // Special handling for edges: if output slice starts/ends at tensor boundary,
-        // use the full original padding and reset input slice to tensor boundary
-        if (output_slice_height_start == 0) {
-            pad_top = padding_n4[0];
-            input_slice_height_start = 0;
-        }
-        if (output_slice_height_end == output_height) {
-            pad_bottom = padding_n4[1];
-            input_slice_height_end = input_height;
-        }
-        if (output_slice_width_start == 0) {
-            pad_left = padding_n4[2];
-            input_slice_width_start = 0;
-        }
-        if (output_slice_width_end == output_width) {
-            pad_right = padding_n4[3];
-            input_slice_width_end = input_width;
-        }
-        uint32_t input_slice_height = input_slice_height_end - input_slice_height_start;
-        uint32_t input_slice_width = input_slice_width_end - input_slice_width_start;
-        uint32_t output_slice_width = output_slice_width_end - output_slice_width_start;
-        // Apply width rounding and adjust right padding if necessary
-        uint32_t width_rounding_value =
-            (conv_config.output_layout == tt::tt_metal::Layout::TILE) ? tt::constants::TILE_HEIGHT : 1;
-
-        bool single_slice =
-            (input_slice_height == std::get<0>(input_shape)) && (input_slice_width == std::get<1>(input_shape));
-
-        if (output_slice_width % width_rounding_value != 0 && !single_slice) {
-            uint32_t additional_padded_width = width_rounding_value - (output_slice_width % width_rounding_value);
-            log_trace(
-                tt::LogOp,
-                "Conv2d DRAM Slicing: Additional padding of {} added to the right side.",
-                additional_padded_width);
-            pad_right += additional_padded_width * stride[1];  // Adjust right padding
-        }
-
-        return {
-            {{input_slice_height_start, input_slice_width_start}, {input_slice_height_end, input_slice_width_end}},
-            {pad_top, pad_bottom, pad_left, pad_right}};
+        const auto plan = get_slice_plan(output_slice_start, output_slice_end);
+        return std::make_tuple(
+            std::make_tuple(
+                IOShape{plan.input_start[0], plan.input_start[1]}, IOShape{plan.input_end[0], plan.input_end[1]}),
+            plan.padding);
     }
 
     std::tuple<IOShape, IOShape> get_input_slice(
@@ -852,15 +804,10 @@ public:
         bool mm_conv = use_matmul_for_1x1_conv(kernel_size, stride, padding_n4, dilation, groups, conv_config);
         TT_FATAL(!mm_conv, "Conv2D DRAM with matmul should never use the slicing code path.");
 
-        auto [input_slicing, slice_padding] = get_input_slice_and_padding(output_slice_start, output_slice_end);
-        auto [input_slice_start, input_slice_end] = input_slicing;
-        auto [input_slice_height_start, input_slice_width_start] = input_slice_start;
-        auto [input_slice_height_end, input_slice_width_end] = input_slice_end;
-        auto input_slice_height = input_slice_height_end - input_slice_height_start;
-        auto input_slice_width = input_slice_width_end - input_slice_width_start;
-
-        auto [output_slice_height, output_slice_width] = calculate_output_image_size(
-            {input_slice_height, input_slice_width}, kernel_size, stride, slice_padding, dilation);
+        const auto plan = get_slice_plan(output_slice_start, output_slice_end);
+        const uint32_t input_slice_height = plan.input_end[0] - plan.input_start[0];
+        const uint32_t input_slice_width = plan.input_end[1] - plan.input_start[1];
+        const auto [output_slice_height, output_slice_width] = plan.output_shape;
         auto compute_grid = device->compute_with_storage_grid_size();
         log_trace(
             tt::LogOp,
@@ -884,7 +831,7 @@ public:
             output_slice_width,
             kernel_size,
             stride,
-            slice_padding,
+            plan.padding,
             dilation,
             groups,
             bias_tensor.has_value(),
@@ -912,16 +859,10 @@ public:
         auto compute_grid_size = device->compute_with_storage_grid_size();
         auto conv_config = this->conv_config;
 
-        auto [input_slicing, slice_padding] = get_input_slice_and_padding(output_slice_start, output_slice_end);
-        auto [input_start, input_end] = input_slicing;
-        uint32_t input_slice_height = std::get<0>(input_end) - std::get<0>(input_start);
-        uint32_t input_slice_width = std::get<1>(input_end) - std::get<1>(input_start);
-        // Use padded output dimensions to match what the halo op actually produces.
-        // The halo output is tile-aligned, so edge slices get additional padding
-        // (e.g., output width 4 pads to 32). Without this, the shard spec is computed
-        // for the unpadded dimensions, leading to L1 underestimation.
-        auto [output_slice_height, output_slice_width] = calculate_output_image_size(
-            {input_slice_height, input_slice_width}, kernel_size, stride, slice_padding, dilation);
+        const auto plan = get_slice_plan(output_slice_start, output_slice_end);
+        const uint32_t input_slice_height = plan.input_end[0] - plan.input_start[0];
+        const uint32_t input_slice_width = plan.input_end[1] - plan.input_start[1];
+        const auto [output_slice_height, output_slice_width] = plan.output_shape;
 
         bool single_slice =
             (input_slice_height == std::get<0>(input_shape)) && (input_slice_width == std::get<1>(input_shape));
@@ -949,7 +890,7 @@ public:
                 kernel_size,
                 stride,
                 dilation,
-                padding_n4,
+                plan.padding,
                 groups,
                 bias_tensor.has_value(),
                 compute_config,
@@ -978,14 +919,9 @@ public:
         const ttnn::Tensor& sliced_input_tensor,
         const IOShape& output_slice_start,
         const IOShape& output_slice_end) override {
-        // Use helper function to calculate slice bounds and padding
-        auto [input_slicing, this_op_padding] = get_input_slice_and_padding(output_slice_start, output_slice_end);
-        auto [input_slice_start, input_slice_end] = input_slicing;
-        auto [input_slice_height_start, input_slice_width_start] = input_slice_start;
-        auto [input_slice_height_end, input_slice_width_end] = input_slice_end;
-        // Calculate dimensions directly from result
-        uint32_t input_slice_height = input_slice_height_end - input_slice_height_start;
-        uint32_t input_slice_width = input_slice_width_end - input_slice_width_start;
+        const auto plan = get_slice_plan(output_slice_start, output_slice_end);
+        const uint32_t input_slice_height = plan.input_end[0] - plan.input_start[0];
+        const uint32_t input_slice_width = plan.input_end[1] - plan.input_start[1];
 
         if (!conv_config.shard_layout.has_value() && sliced_input_tensor.is_sharded()) {
             conv_config.shard_layout = sliced_input_tensor.memory_config().memory_layout();
@@ -1009,7 +945,7 @@ public:
             input_slice_width,
             kernel_size,
             stride,
-            this_op_padding,
+            plan.padding,
             dilation,
             groups,
             output_dtype,

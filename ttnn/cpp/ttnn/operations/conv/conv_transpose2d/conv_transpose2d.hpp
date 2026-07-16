@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <tuple>
@@ -58,6 +59,25 @@ ConvTranspose2dResultWithOptions conv_transpose2d(
 }  // namespace ttnn
 
 namespace ttnn::operations::conv::conv_transpose2d {
+
+struct ConvTranspose2dSlicePlan {
+    std::array<uint32_t, 2> input_start;
+    std::array<uint32_t, 2> input_end;
+    std::array<uint32_t, 2> output_shape;
+    std::array<uint32_t, 4> padding;
+    std::array<uint32_t, 2> output_padding;
+};
+
+ConvTranspose2dSlicePlan determine_conv_transpose2d_slice_plan(
+    std::array<uint32_t, 2> input_shape,
+    std::array<uint32_t, 2> output_slice_start,
+    std::array<uint32_t, 2> output_slice_end,
+    std::array<uint32_t, 2> kernel_size,
+    std::array<uint32_t, 2> stride,
+    std::array<uint32_t, 4> padding,
+    std::array<uint32_t, 2> output_padding,
+    std::array<uint32_t, 2> dilation,
+    Layout output_layout);
 
 std::unique_ptr<op_slicing::OpSliceAttr> get_conv_transpose2d_slice_attr(
     uint32_t batch_size,

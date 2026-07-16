@@ -124,7 +124,7 @@ def run_conv_transpose2d(
             if input_memory_config is not None
             else (ttnn.DRAM_MEMORY_CONFIG if dram_slice_config is not None else ttnn.L1_MEMORY_CONFIG)
         )
-        prep_input_layout = layout if input_memory_config is not None else ttnn.ROW_MAJOR_LAYOUT
+        prep_input_layout = layout
         tt_weight_tensor = ttnn.prepare_conv_transpose2d_weights(
             weight_tensor=tt_weight_tensor,
             input_memory_config=prep_input_memory_config,
@@ -164,7 +164,7 @@ def run_conv_transpose2d(
                 kernel_size=(filter_height, filter_width),
                 stride=(stride_h, stride_w),
                 padding=(pad_h, pad_w),
-                # output_padding=(out_pad_h, out_pad_w),
+                output_padding=(out_pad_h, out_pad_w),
                 dilation=(dilation, dilation),
                 groups=groups,
                 conv_config=conv_config,

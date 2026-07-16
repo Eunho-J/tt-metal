@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -132,6 +133,23 @@ std::tuple<uint32_t, uint32_t> calculate_output_image_size(
     std::array<uint32_t, 2> stride,
     std::array<uint32_t, 4> padding,
     std::array<uint32_t, 2> dilation);
+
+struct Conv2dSlicePlan {
+    std::array<uint32_t, 2> input_start;
+    std::array<uint32_t, 2> input_end;
+    std::array<uint32_t, 4> padding;
+    std::array<uint32_t, 2> output_shape;
+};
+
+Conv2dSlicePlan determine_conv2d_slice_plan(
+    std::array<uint32_t, 2> input_shape,
+    std::array<uint32_t, 2> output_start,
+    std::array<uint32_t, 2> output_end,
+    std::array<uint32_t, 2> kernel_size,
+    std::array<uint32_t, 2> stride,
+    std::array<uint32_t, 4> padding,
+    std::array<uint32_t, 2> dilation,
+    Layout output_layout);
 
 std::tuple<uint32_t, uint32_t> calculate_ct2d_output_image_size(
     std::array<uint32_t, 2> input_image_size,
@@ -346,8 +364,7 @@ ttnn::Tensor fold_tensor(
     std::array<uint32_t, 4> padding_n4,
     uint32_t batch_size,
     uint32_t input_height,
-    uint32_t input_width,
-    uint32_t in_channels);
+    uint32_t input_width);
 
 struct KernelStrideFoldingResult {
     uint32_t input_height;

@@ -137,6 +137,8 @@ ttnn::Tensor prepare_conv_bias(
 // Internal entry points for lowered operations whose logical parameters can disallow the direct matmul path.
 namespace detail {
 
+DataType get_conv_bias_weight_dtype(const Conv2dConfig& conv_config);
+
 ttnn::Tensor prepare_conv_weights(
     const ttnn::Tensor& weight_tensor,
     const ttnn::MemoryConfig& input_memory_config,
@@ -160,7 +162,8 @@ ttnn::Tensor prepare_conv_weights(
     const std::optional<const DeviceComputeKernelConfig>& compute_config_,
     const std::optional<const Conv2dSliceConfig>& dram_slice_config_,
     bool allow_matmul,
-    bool use_depthwise_weight_plan_shape);
+    bool use_depthwise_weight_plan_shape,
+    std::optional<std::array<uint32_t, 2>> input_tensor_hw = std::nullopt);
 
 ttnn::Tensor prepare_conv_bias(
     const ttnn::Tensor& bias_tensor,
@@ -182,7 +185,8 @@ ttnn::Tensor prepare_conv_bias(
     const std::optional<const Conv2dConfig>& conv_config_,
     const std::optional<const DeviceComputeKernelConfig>& compute_config_,
     const std::optional<const Conv2dSliceConfig>& dram_slice_config_,
-    bool allow_matmul);
+    bool allow_matmul,
+    std::optional<std::array<uint32_t, 2>> input_tensor_hw = std::nullopt);
 
 }  // namespace detail
 
@@ -208,7 +212,8 @@ struct Conv2dWeightsBiasPrepConfig {
         bool enable_activation_reuse_ = false,
         bool coalesce_1d_depthwise_kw_reads_ = false,
         bool use_depthwise_weight_plan_shape_ = false,
-        std::array<uint32_t, 2> stride_ = {1, 1}) :
+        std::array<uint32_t, 2> stride_ = {1, 1},
+        std::optional<uint32_t> input_channels_padded_before_folding_ = std::nullopt) :
         input_channels_padded(input_channels_padded_),
         weights_bias_dtype(weights_bias_dtype_),
         weight_block_h_ntiles(weight_block_h_ntiles_),
@@ -226,6 +231,7 @@ struct Conv2dWeightsBiasPrepConfig {
         coalesce_1d_depthwise_kw_reads(coalesce_1d_depthwise_kw_reads_),
         use_depthwise_weight_plan_shape(use_depthwise_weight_plan_shape_),
         stride(stride_),
+        input_channels_padded_before_folding(input_channels_padded_before_folding_),
         interleaved_mm_conv(interleaved_mm_conv),
         out_channels(out_channels_) {}
 
@@ -252,6 +258,7 @@ struct Conv2dWeightsBiasPrepConfig {
 
     // Kernel stride folding parameter
     const std::array<uint32_t, 2> stride;
+    const std::optional<uint32_t> input_channels_padded_before_folding;
     // This conv will go through auto shard codepath for matmul based convs
     const bool interleaved_mm_conv;
     // Output channels (mandatory)
@@ -275,6 +282,7 @@ struct Conv2dWeightsBiasPrepConfig {
         "coalesce_1d_depthwise_kw_reads",
         "use_depthwise_weight_plan_shape",
         "stride",
+        "input_channels_padded_before_folding",
         "interleaved_mm_conv",
         "out_channels");
     auto attribute_values() const {
@@ -296,6 +304,7 @@ struct Conv2dWeightsBiasPrepConfig {
             std::cref(this->coalesce_1d_depthwise_kw_reads),
             std::cref(this->use_depthwise_weight_plan_shape),
             std::cref(this->stride),
+            std::cref(this->input_channels_padded_before_folding),
             std::cref(this->interleaved_mm_conv),
             std::cref(this->out_channels));
     }
