@@ -931,6 +931,7 @@ Result conv_transpose2d_DRAM(
     const DataType output_dtype = dtype.value_or(input_tensor.dtype());
     // Use weights_dtype from config if set, otherwise use weight tensor's dtype
     DataType weight_dtype = conv_config.weights_dtype.value_or(weight_tensor.dtype());
+    conv_config.weights_dtype = weight_dtype;
     DeviceComputeKernelConfig compute_config =
         compute_config_.value_or(get_conv_default_compute_kernel_config(device, input_tensor.dtype(), weight_dtype));
 

@@ -55,6 +55,7 @@ def run_conv_transpose2d(
     input_memory_config=None,
     reshard_if_not_optimal=False,
     expected_memory_layout=None,
+    infer_weights_dtype=False,
 ):
     torch.manual_seed(0)
     conv_input_shape = [batch_size, input_channels, input_height, input_width]
@@ -99,7 +100,7 @@ def run_conv_transpose2d(
         shard_layout = None
 
     conv_config = ttnn.Conv2dConfig(
-        weights_dtype=weights_dtype,
+        weights_dtype=None if infer_weights_dtype else weights_dtype,
         shard_layout=shard_layout,
         deallocate_activation=deallocate_activation,
         enable_act_double_buffer=enable_act_double_buffer,
@@ -107,6 +108,8 @@ def run_conv_transpose2d(
         config_tensors_in_dram=config_tensors_in_dram,
         reshard_if_not_optimal=reshard_if_not_optimal,
     )
+    if infer_weights_dtype:
+        assert conv_config.weights_dtype is None
     compute_config = ttnn.init_device_compute_kernel_config(
         device.arch(),
         math_fidelity=math_fidelity,
