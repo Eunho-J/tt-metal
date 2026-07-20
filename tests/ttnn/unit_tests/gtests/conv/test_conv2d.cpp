@@ -86,6 +86,14 @@ TEST(Conv2DSlicePlannerTest, TileWidthSliceCountUsesTileUnits) {
     EXPECT_EQ(op_slicing::get_output_slice_range(65, Layout::TILE, slice_config, 2).end, 65);
 }
 
+TEST(Conv2DSlicePlannerTest, RejectsZeroSliceCountBeforeComputingRange) {
+    const auto slice_config =
+        op_slicing::Op2DSliceConfig{.slice_type = op_slicing::Op2DSliceConfig::SliceType::DRAM_WIDTH, .num_slices = 0};
+
+    EXPECT_THROW(op_slicing::validate_slice_config(64, Layout::TILE, slice_config), std::runtime_error);
+    EXPECT_THROW((void)op_slicing::get_output_slice_range(64, Layout::TILE, slice_config, 0), std::runtime_error);
+}
+
 TEST(Conv2DFoldPlannerTest, PreservesPhysicalChannelsInHeightShardedFold) {
     const auto input_grid = CoreRangeSet{CoreRange{CoreCoord{0, 0}, CoreCoord{0, 0}}};
     const auto input_memory_config = MemoryConfig{

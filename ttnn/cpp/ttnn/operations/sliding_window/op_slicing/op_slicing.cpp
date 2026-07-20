@@ -39,6 +39,7 @@ OutputSliceRange get_output_slice_range(
     tt::tt_metal::Layout output_layout,
     const Op2DSliceConfig& slice_config,
     uint32_t slice_index) {
+    TT_FATAL(slice_config.num_slices > 0, "Number of slices must be greater than 0.");
     const uint32_t slice_rounding_value = compute_slice_rounding_value(output_layout, slice_config.slice_type);
     const uint32_t output_slice_units = tt::div_up(output_sliced_dim, slice_rounding_value);
     const uint32_t min_output_slice_units = output_slice_units / slice_config.num_slices;
@@ -54,6 +55,7 @@ OutputSliceRange get_output_slice_range(
 
 void validate_slice_config(
     uint32_t output_sliced_dim, tt::tt_metal::Layout output_layout, const Op2DSliceConfig& slice_config) {
+    TT_FATAL(slice_config.num_slices > 0, "Number of slices must be greater than 0.");
     const uint32_t max_num_slices = get_max_num_slices(output_sliced_dim, output_layout, slice_config.slice_type);
     TT_FATAL(
         slice_config.num_slices <= max_num_slices,
