@@ -28,7 +28,7 @@ void bind_conv1d(nb::module_& mod) {
         Applies a 1D convolution over an input signal composed of several input planes. Implemented as a 2D Convolution of input height 1 and input width as input_length.
 
         Args:
-            input_tensor (ttnn.Tensor): The input tensor. This must be in the format [N, H, W, C]. It can be on host or device.
+            input_tensor (ttnn.Tensor): The input tensor in [N, L, C] format or a flatten-compatible rank-4 [N, H, W, C] format. It can be on host or device.
             weight_tensor (ttnn.Tensor): The weight tensor. The weights can be passed in the same format as PyTorch, [out_channels, in_channels, kernel_height, kernel_width].
             device (ttnn.MeshDevice): The device to use.
             in_channels (int): Number of input channels.

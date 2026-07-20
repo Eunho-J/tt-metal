@@ -27,6 +27,23 @@ struct Op2DSliceConfig {
     uint32_t num_slices = 0;
 };
 
+struct OutputSliceRange {
+    uint32_t start;
+    uint32_t end;
+};
+
+uint32_t get_max_num_slices(
+    uint32_t output_sliced_dim, tt::tt_metal::Layout output_layout, Op2DSliceConfig::SliceType slice_type);
+
+OutputSliceRange get_output_slice_range(
+    uint32_t output_sliced_dim,
+    tt::tt_metal::Layout output_layout,
+    const Op2DSliceConfig& slice_config,
+    uint32_t slice_index);
+
+void validate_slice_config(
+    uint32_t output_sliced_dim, tt::tt_metal::Layout output_layout, const Op2DSliceConfig& slice_config);
+
 class OpSliceAttr {
 public:
     using OptionalRefTensor = std::optional<std::reference_wrapper<ttnn::Tensor>>;

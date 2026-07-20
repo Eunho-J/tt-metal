@@ -11,6 +11,7 @@
 #include "ttnn/operations/conv/conv_types.hpp"
 #include "ttnn/operations/conv/conv2d/conv2d.hpp"
 #include "ttnn/operations/core/core.hpp"
+#include "ttnn/operations/experimental/reshape/view.hpp"
 
 namespace ttnn {
 
@@ -35,11 +36,35 @@ Conv1dResult conv1d(
     const std::optional<const Conv1dSliceConfig>& slice_config,
     bool return_output_dim,
     bool return_weights_and_bias) {
-    // reshape input tensor to 4D, if it is not already
+    const auto& input_logical_shape = input_tensor.logical_shape();
+    const bool is_rank_3_input = input_logical_shape.rank() == 3;
+    const bool has_expected_rank_3_shape = is_rank_3_input && input_logical_shape[0] == batch_size &&
+                                           input_logical_shape[1] == input_length &&
+                                           input_logical_shape[2] == in_channels;
+    const bool has_compatible_rank_4_shape =
+        input_logical_shape.rank() == 4 && input_logical_shape[3] == in_channels &&
+        input_logical_shape[0] * input_logical_shape[1] * input_logical_shape[2] == batch_size * input_length;
+    TT_FATAL(
+        has_expected_rank_3_shape || has_compatible_rank_4_shape,
+        "Conv1D input must have shape [batch_size, input_length, in_channels] or "
+        "a rank-4 [N, H, W, C] shape where N*H*W=batch_size*input_length and C=in_channels. Got {} for "
+        "batch_size={}, input_length={}, in_channels={}",
+        input_logical_shape,
+        batch_size,
+        input_length,
+        in_channels);
+
+    // Insert conv2d's singleton height without changing the input's physical padding or storage.
+    const auto& input_padded_shape = input_tensor.padded_shape();
+    const auto input_logical_shape_4d =
+        is_rank_3_input ? Shape({input_logical_shape[0], 1, input_logical_shape[1], input_logical_shape[2]})
+                        : input_logical_shape;
+    const auto input_padded_shape_4d =
+        is_rank_3_input ? Shape({input_padded_shape[0], 1, input_padded_shape[1], input_padded_shape[2]})
+                        : input_padded_shape;
     const ttnn::Tensor& input_tensor_4d =
-        (input_tensor.logical_shape().rank() < 4)
-            ? ttnn::reshape(input_tensor, Shape({batch_size, 1, input_length, in_channels}))
-            : input_tensor;
+        is_rank_3_input ? ttnn::experimental::view(input_tensor, input_logical_shape_4d, input_padded_shape_4d)
+                        : input_tensor;
 
     // Reinterpret the 3D conv1d weight [out_channels, in_channels/groups, kernel_size] as 4D
     // [.., 1, kernel_size], matching the [N, 1, input_length, C] input reshape and the {1, kernel_size}

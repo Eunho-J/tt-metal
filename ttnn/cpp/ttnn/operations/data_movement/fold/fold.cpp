@@ -343,17 +343,18 @@ static Tensor apply_halo_padding(
     return ttnn::reshape(halo_output, padded_shape);
 }
 
-// Each core needs to process multiple of (stride_h * input_width) rows to ensure that
-// the fold operation can be performed locally and do not need to read from remote cores.
-// This function checks if the current shard height is divisible by (stride_h * input_width).
-// If not, it calculates an optimal number of cores and corresponding shard height
-// to enable efficient fold computation across the tensor dimensions.
-Tensor reshard_if_needed(const Tensor& input, const uint32_t stride_h, const uint32_t /*stride_w*/) {
-    ttnn::Shape input_shape = input.logical_shape();
+MemoryConfig determine_fold_reshard_memory_config(
+    const MemoryConfig& input_memory_config,
+    const Shape& input_shape,
+    const uint32_t stride_h,
+    const CoreCoord& compute_grid_size) {
+    if (!input_memory_config.is_sharded()) {
+        return input_memory_config;
+    }
+
     uint32_t input_width = input_shape[2];
     uint32_t pixels_per_compute_row = stride_h * input_width;
-    uint32_t current_shard_height = input.shard_spec().value().shape[0];
-    const CoreCoord& compute_grid_size = input.device()->compute_with_storage_grid_size();
+    uint32_t current_shard_height = input_memory_config.shard_spec().value().shape[0];
     if (current_shard_height % pixels_per_compute_row != 0) {
         uint32_t max_cores = compute_grid_size.x * compute_grid_size.y;
         uint32_t total_height = input_shape[0] * input_shape[1] * input_shape[2];
@@ -367,17 +368,103 @@ Tensor reshard_if_needed(const Tensor& input, const uint32_t stride_h, const uin
 
         uint32_t optimal_shard_height = tt::round_up(total_height / num_cores, pixels_per_compute_row);
 
-        auto new_shard_spec = input.shard_spec().value();
+        auto new_shard_spec = input_memory_config.shard_spec().value();
         new_shard_spec.shape[0] = optimal_shard_height;
 
-        // Create new core range set using the calculated number of cores
-        CoreRangeSet new_core_range = tt::tt_metal::num_cores_to_corerangeset(num_cores, compute_grid_size, true);
-        new_shard_spec.grid = new_core_range;
+        new_shard_spec.grid = tt::tt_metal::num_cores_to_corerangeset(num_cores, compute_grid_size, true);
+        return MemoryConfig(input_memory_config.memory_layout(), input_memory_config.buffer_type(), new_shard_spec);
+    }
+    return input_memory_config;
+}
 
-        auto new_mem_config =
-            MemoryConfig(input.memory_config().memory_layout(), input.memory_config().buffer_type(), new_shard_spec);
-        // need to reshard
-        return ttnn::reshard(input, new_mem_config, std::nullopt);
+MemoryConfig determine_fold_output_memory_config(
+    const MemoryConfig& input_memory_config, const uint32_t stride_h, const uint32_t stride_w) {
+    if (!input_memory_config.is_sharded()) {
+        return input_memory_config;
+    }
+
+    auto output_shard_spec = input_memory_config.shard_spec().value();
+    output_shard_spec.shape[0] /= stride_h * stride_w;
+    output_shard_spec.shape[1] *= stride_h * stride_w;
+    return MemoryConfig(input_memory_config.memory_layout(), input_memory_config.buffer_type(), output_shard_spec);
+}
+
+FoldedTensorLayout determine_folded_tensor_layout(
+    const Shape& input_shape,
+    const MemoryConfig& input_memory_config,
+    const uint32_t stride_h,
+    const uint32_t stride_w,
+    const std::array<uint32_t, 4>& padding,
+    const CoreCoord& compute_grid_size) {
+    if (!input_memory_config.is_sharded()) {
+        return {.memory_config = input_memory_config, .layout = Layout::ROW_MAJOR};
+    }
+    TT_FATAL(
+        input_memory_config.memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
+            input_memory_config.shard_spec().has_value(),
+        "Kernel stride folding requires height-sharded input memory with a shard spec.");
+    if (!input_memory_config.is_l1()) {
+        return {
+            .memory_config = determine_fold_output_memory_config(input_memory_config, stride_h, stride_w),
+            .layout = Layout::ROW_MAJOR};
+    }
+
+    MemoryConfig processed_memory_config = input_memory_config;
+    Shape processed_shape = input_shape;
+    const auto& input_shard_spec = input_memory_config.shard_spec().value();
+    if (input_shape[-1] != input_shard_spec.shape[1]) {
+        processed_shape = Shape({input_shape[0], input_shape[1], input_shape[2], input_shard_spec.shape[1]});
+        processed_memory_config =
+            create_sharded_memory_config(processed_shape, input_shard_spec.grid, ShardOrientation::ROW_MAJOR);
+    }
+
+    const bool has_hw_padding = (padding[0] | padding[1] | padding[2] | padding[3]) != 0;
+    if (has_hw_padding) {
+        const auto& shard_spec = processed_memory_config.shard_spec().value();
+        sliding_window::SlidingWindowConfig sliding_window_config{
+            .batch_size = processed_shape[0],
+            .input_hw = {processed_shape[1], processed_shape[2]},
+            .window_hw = {1, 1},
+            .stride_hw = {1, 1},
+            .padding = padding,
+            .dilation_hw = {1, 1},
+            .num_cores_nhw = static_cast<uint32_t>(shard_spec.grid.num_cores()),
+            .num_cores_c = 1,
+            .core_range_set = shard_spec.grid,
+            .snap_to_tile = false};
+        const auto shard_boundaries = sliding_window::generate_shard_boundaries(sliding_window_config);
+        auto padded_shard_spec = shard_spec;
+        const uint32_t max_out_nsticks_per_core = sliding_window::generate_max_out_nsticks_per_core(shard_boundaries);
+        // Halo receives the input flattened to [1, 1, N*H*W, C], so its physical output shard height is exactly the
+        // maximum number of output sticks assigned to any core. The later logical reshape back to [N, H, W, C] does
+        // not redistribute that storage.
+        padded_shard_spec.shape[0] = max_out_nsticks_per_core;
+        processed_memory_config =
+            MemoryConfig(input_memory_config.memory_layout(), input_memory_config.buffer_type(), padded_shard_spec);
+        processed_shape = Shape(
+            {processed_shape[0],
+             processed_shape[1] + padding[0] + padding[1],
+             processed_shape[2] + padding[2] + padding[3],
+             processed_shape[3]});
+    }
+
+    processed_memory_config =
+        determine_fold_reshard_memory_config(processed_memory_config, processed_shape, stride_h, compute_grid_size);
+    return {
+        .memory_config = determine_fold_output_memory_config(processed_memory_config, stride_h, stride_w),
+        .layout = Layout::ROW_MAJOR};
+}
+
+// Each core needs to process multiple of (stride_h * input_width) rows to ensure that
+// the fold operation can be performed locally and do not need to read from remote cores.
+// This function checks if the current shard height is divisible by (stride_h * input_width).
+// If not, it calculates an optimal number of cores and corresponding shard height
+// to enable efficient fold computation across the tensor dimensions.
+Tensor reshard_if_needed(const Tensor& input, const uint32_t stride_h, const uint32_t /*stride_w*/) {
+    const auto target_memory_config = determine_fold_reshard_memory_config(
+        input.memory_config(), input.logical_shape(), stride_h, input.device()->compute_with_storage_grid_size());
+    if (target_memory_config != input.memory_config()) {
+        return ttnn::reshard(input, target_memory_config, std::nullopt);
     }
     return input;
 }

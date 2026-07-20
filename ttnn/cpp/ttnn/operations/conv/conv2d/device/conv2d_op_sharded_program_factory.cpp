@@ -424,30 +424,14 @@ tt::tt_metal::ProgramDescriptor build_program_descriptor_sharded(
 
         if (block_sharded) {
             const auto& output_shard_spec = output.shard_spec().value();
-            TT_FATAL(input_cores == output_cores, "1D depthwise BLOCK_SHARDED input/output grids must match");
             TT_FATAL(
-                a.shard_spec()->orientation == output_shard_spec.orientation,
-                "1D depthwise BLOCK_SHARDED input/output shard orientations must match");
-            TT_FATAL(
-                parallelization_config.num_cores_c_in == parallelization_config.num_cores_c_out &&
-                    conv_act_c_blocks == out_conv_c_blocks,
-                "1D depthwise BLOCK_SHARDED input/output channel core counts must match");
-            TT_FATAL(
-                shard_shape[1] == output_shard_spec.shape[1] &&
-                    shard_shape[1] == act_block_w_ntiles * tt::constants::TILE_WIDTH &&
-                    shard_shape[1] == per_core_out_matrix_width_ntiles * tt::constants::TILE_WIDTH,
-                "1D depthwise BLOCK_SHARDED local channel widths must match. Input shard: {}, output shard: {}, "
-                "activation block: {}, output block: {}",
+                input_cores == output_cores && a.shard_spec()->orientation == output_shard_spec.orientation &&
+                    parallelization_config.num_cores_c_in == parallelization_config.num_cores_c_out &&
+                    conv_act_c_blocks == out_conv_c_blocks && shard_shape[1] == output_shard_spec.shape[1],
+                "1D depthwise BLOCK_SHARDED input/output channel partitions must match. Input/output shard widths: "
+                "{}/{}",
                 shard_shape[1],
-                output_shard_spec.shape[1],
-                act_block_w_ntiles * tt::constants::TILE_WIDTH,
-                per_core_out_matrix_width_ntiles * tt::constants::TILE_WIDTH);
-            TT_FATAL(
-                !coalesce_1d_depthwise_kw_reads,
-                "1D depthwise BLOCK_SHARDED convolution requires per-tap activation reads");
-            TT_FATAL(
-                conv_act_c_read_bytes == shard_shape[1] * a.element_size(),
-                "1D depthwise BLOCK_SHARDED reader must consume exactly one local channel shard");
+                output_shard_spec.shape[1]);
         }
     }
     // check is for 16-byte alignment
@@ -601,10 +585,6 @@ tt::tt_metal::ProgramDescriptor build_program_descriptor_sharded(
         per_core_out_matrix_width_ntiles,
         weight_block_w_ntiles);
     uint32_t num_blocks_weight_w_per_core = per_core_out_matrix_width_ntiles / weight_block_w_ntiles;
-    TT_FATAL(
-        !is_conv_1d_depthwise_conv || !block_sharded || num_blocks_weight_w_per_core == 1,
-        "1D depthwise BLOCK_SHARDED convolution requires one local output-channel weight block, got {}",
-        num_blocks_weight_w_per_core);
     if (height_sharded) {
         TT_FATAL(
             num_blocks_weight_w_per_core == num_blocks_weight_w,
